@@ -123,6 +123,12 @@ struct MapData {
   uint32_t nRoute;
 };
 
+struct View {
+  float px, py;
+  float cosH, sinH;
+  float mpp;
+};
+
 struct RxItem {
   uint16_t len;
   uint8_t data[250];
@@ -721,12 +727,6 @@ void drawIdleScreen(const GpsData &g, bool connected) {
   else snprintf(b, sizeof(b), "GPS buscando...");
   textCentered(b, 418, u8g2_font_helvB14_tf, C_DIM);
 }
-
-struct View {
-  float px, py;
-  float cosH, sinH;
-  float mpp;
-};
 
 static inline void toScreen(const View &v, float wx, float wy, float &sx, float &sy) {
   float dx = wx - v.px, dy = wy - v.py;
