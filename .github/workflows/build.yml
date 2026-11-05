@@ -49,11 +49,13 @@ jobs:
           arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@3.3.10
-          arduino-cli lib install "GFX Library for Arduino@1.6.4" "U8g2" "TinyGPSPlus"
+          arduino-cli lib install "U8g2" "TinyGPSPlus"
+          git clone --depth 1 https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-1.75.git waveshare
       - name: Compile
         run: |
           arduino-cli compile \
             --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,CDCOnBoot=cdc" \
+            --libraries waveshare/examples/arduino/libraries/GFX_Library_for_Arduino \
             --output-dir out firmware/MotoNav
       - uses: actions/upload-artifact@v4
         with:

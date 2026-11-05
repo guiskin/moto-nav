@@ -8,7 +8,7 @@ Navegação seta a seta para moto: app de iPhone (rotas do Apple Maps) + placa W
 
 ## Firmware
 
-Arduino IDE 2, core `esp32` 3.3.10, bibliotecas: GFX Library for Arduino 1.6.4, U8g2, TinyGPSPlus.
+Arduino IDE 2, core `esp32` 3.3.10, bibliotecas: GFX Library for Arduino da pasta `examples/arduino/libraries` do repositório da Waveshare, U8g2, TinyGPSPlus.
 Placa ESP32S3 Dev Module · Flash 16MB · Partition 16M Flash (3MB APP/9.9MB FATFS) · PSRAM OPI · USB CDC On Boot Enabled.
 
 ## Protocolo BLE
