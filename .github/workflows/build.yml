@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   ios:
     runs-on: macos-15
@@ -32,6 +35,13 @@ jobs:
         with:
           name: MotoNav-ipa
           path: ios/MotoNav.ipa
+      - name: Publish release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view app >/dev/null 2>&1 || gh release create app --title "App iPhone" --notes "MotoNav.ipa para instalar com o Sideloadly"
+          gh release upload app ios/MotoNav.ipa --clobber
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -61,3 +71,11 @@ jobs:
         with:
           name: MotoNav-firmware
           path: out/MotoNav.ino.merged.bin
+      - name: Publish release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp out/MotoNav.ino.merged.bin MotoNav-firmware.bin
+          gh release view firmware >/dev/null 2>&1 || gh release create firmware --title "Firmware da placa" --notes "Gravar no endereço 0x0"
+          gh release upload firmware MotoNav-firmware.bin --clobber
