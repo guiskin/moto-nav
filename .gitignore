@@ -1,0 +1,7 @@
+ios/build/
+ios/*.xcodeproj/
+ios/MotoNav/Info.plist
+ios/Payload/
+*.ipa
+.DS_Store
+firmware/MotoNav/build/
