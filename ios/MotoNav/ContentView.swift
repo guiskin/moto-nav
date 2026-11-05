@@ -175,6 +175,11 @@ struct ContentView: View {
             VStack(alignment: .leading) {
                 Text("\(Format.distance(s.remainingDistance)) · \(Format.duration(s.remainingTime))").font(.headline)
                 Text("\(Int(s.speedKmh.rounded())) km/h").foregroundStyle(.secondary)
+                if let p = ble.uploadProgress {
+                    Text("Enviando mapa \(Int(p * 100))%").font(.caption).foregroundStyle(.orange)
+                } else if let m = engine.mapStatus {
+                    Text(m).font(.caption).foregroundStyle(.orange)
+                }
             }
             Spacer()
             Button("Encerrar", role: .destructive) { engine.stop() }

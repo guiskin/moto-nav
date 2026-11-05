@@ -13,7 +13,15 @@ Placa ESP32S3 Dev Module · Flash 16MB · Partition 16M Flash (3MB APP/9.9MB FAT
 
 ## Protocolo BLE
 
-Serviço `6E0A0001-7A3B-4C2D-9E1F-0B5A4D3C2B1A`, característica `6E0A0002-…` (write / write without response).
+Serviço `6E0A0001-7A3B-4C2D-9E1F-0B5A4D3C2B1A`. Característica `6E0A0002-…` para navegação (0x01) e posição (0x02); `6E0A0003-…` para o mapa (0x10 início, 0x11 bloco, 0x12 fim).
+
+Mapa: ao iniciar a rota o app baixa as ruas ao redor do OpenStreetMap (Overpass API), simplifica e envia para a placa, que desenha o mapa girando com a direção. Toque na tela ou aperte BOOT para alternar mapa/seta.
+
+Posição (0x02): id do mapa u16, x/y em decímetros (i32, relativos à origem do mapa), rumo u16 (centésimos de grau, 0xFFFF = indefinido), velocidade u16 (cm/s), distância percorrida na rota i32 (dm, -1 = fora da rota).
+
+Mapa (blob): `MNM1`, u16 nº de linhas; cada linha: u8 tipo (0 rota, 1 rodovia, 2 principal, 3 coletora, 4 local), u16 nº de pontos, i32 x0, i32 y0 (metros), depois deltas i16 dx, dy.
+
+Navegação (0x01):
 
 | Byte | Campo |
 | --- | --- |

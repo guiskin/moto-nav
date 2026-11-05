@@ -27,6 +27,7 @@ final class NavigationEngine: ObservableObject {
     @Published private(set) var calculating = false
     @Published private(set) var errorText: String?
     @Published private(set) var simulating = false
+    @Published private(set) var mapStatus: String?
     @Published var avoidTolls = false
     @Published var avoidHighways = false
 
@@ -41,10 +42,20 @@ final class NavigationEngine: ObservableObject {
     private let simSpeed: Double = 40 / 3.6
     private var heartbeat: Timer?
     private var lastFix: CLLocation?
+    private var geometryVersion = 0
+    private var latestMap: BuiltMap?
+    private var latestMapVersion = -1
+    private var activeMap: BuiltMap?
+    private var activeMapVersion = -1
+    private var nextMapId = UInt16.random(in: 1...60_000)
+    private var mapTask: Task<Void, Never>?
 
     func attach(location: LocationProvider, ble: BLEManager) {
         self.location = location
         self.ble = ble
+        ble.onReady = { [weak self] in
+            Task { @MainActor in self?.uploadLatestMap() }
+        }
         location.onUpdate = { [weak self] loc in
             Task { @MainActor in self?.handle(location: loc, simulated: false) }
         }
@@ -88,13 +99,71 @@ final class NavigationEngine: ObservableObject {
     private func setRoute(_ r: MKRoute) {
         route = r
         geometry = RouteGeometry(route: r)
+        geometryVersion += 1
         segmentHint = nil
         offRouteCount = 0
+        if mode == .navigating { rebuildMap() }
+    }
+
+    private func rebuildMap() {
+        guard let g = geometry else { return }
+        mapTask?.cancel()
+        let version = geometryVersion
+        nextMapId = nextMapId == UInt16.max ? 1 : nextMapId + 1
+        let id = nextMapId
+        mapStatus = "Baixando mapa..."
+        mapTask = Task { [weak self] in
+            let built = await MapBuilder.build(id: id, geometry: g)
+            guard let self = self, !Task.isCancelled, self.geometryVersion == version, self.mode == .navigating else { return }
+            self.latestMap = built
+            self.latestMapVersion = version
+            self.uploadLatestMap()
+        }
+    }
+
+    private func uploadLatestMap() {
+        guard mode == .navigating, let built = latestMap, latestMapVersion == geometryVersion, let ble = ble, ble.isConnected else { return }
+        let version = latestMapVersion
+        mapStatus = "Enviando mapa..."
+        ble.sendMap(id: built.id, blob: built.blob) { [weak self] in
+            Task { @MainActor in
+                guard let self = self, self.geometryVersion == version else { return }
+                self.activeMap = built
+                self.activeMapVersion = version
+                self.mapStatus = built.roadCount == 0 ? "Mapa só com a rota (sem dados de ruas)" : nil
+                if let fix = self.lastFix { self.handle(location: fix, simulated: self.simulating) }
+            }
+        }
+    }
+
+    private func sendPosition(_ loc: CLLocation, projection proj: RouteGeometry.Projection?, geometry g: RouteGeometry) {
+        guard let ble = ble, let map = activeMap else { return }
+        let p = map.projection.project(loc.coordinate)
+        var along: Int32 = -1
+        if let proj = proj, activeMapVersion == geometryVersion, proj.offRoute < 30 {
+            let i = proj.segment
+            let cum = map.routeLocalCum
+            if i + 1 < cum.count && i + 1 < g.cum.count {
+                let segLen = g.cum[i + 1] - g.cum[i]
+                let t = segLen > 0 ? min(max((proj.along - g.cum[i]) / segLen, 0), 1) : 0
+                along = Int32(clamping: Int(((cum[i] + (cum[i + 1] - cum[i]) * t) * 10).rounded()))
+            }
+        }
+        var d = Data([0x02])
+        appendLE(&d, map.id)
+        appendLE(&d, Int32(clamping: Int((p.x * 10).rounded())))
+        appendLE(&d, Int32(clamping: Int((p.y * 10).rounded())))
+        let heading: UInt16 = loc.course >= 0 ? UInt16(clamping: Int((loc.course * 100).rounded()) % 36_000) : 0xFFFF
+        appendLE(&d, heading)
+        appendLE(&d, UInt16(clamping: Int((max(0, loc.speed) * 100).rounded())))
+        appendLE(&d, along)
+        ble.sendPosition(d)
     }
 
     func start(simulate: Bool) {
         guard geometry != nil else { return }
         mode = .navigating
+        rebuildMap()
         location?.setBackground(true)
         UIApplication.shared.isIdleTimerDisabled = true
         if simulate { startSimulation() }
@@ -103,6 +172,11 @@ final class NavigationEngine: ObservableObject {
 
     func stop() {
         stopSimulation()
+        mapTask?.cancel()
+        mapTask = nil
+        latestMap = nil
+        activeMap = nil
+        mapStatus = nil
         mode = .idle
         route = nil
         geometry = nil
@@ -187,6 +261,7 @@ final class NavigationEngine: ObservableObject {
         }
         snapshot = s
         pushToDevice()
+        sendPosition(loc, projection: proj, geometry: g)
     }
 
     private func reroute(from loc: CLLocation) {
