@@ -65,7 +65,7 @@ jobs:
         run: |
           arduino-cli compile \
             --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,CDCOnBoot=cdc" \
-            --libraries waveshare/examples/arduino/libraries/GFX_Library_for_Arduino \
+            --library waveshare/examples/arduino/libraries/GFX_Library_for_Arduino \
             --output-dir out firmware/MotoNav
       - uses: actions/upload-artifact@v4
         with:
