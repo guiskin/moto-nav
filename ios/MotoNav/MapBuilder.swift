@@ -30,7 +30,7 @@ struct BuiltMap {
 }
 
 enum MapBuilder {
-    static func build(id: UInt16, geometry: RouteGeometry) async -> BuiltMap {
+    static func build(id: UInt16, geometry: RouteGeometry, withRoads: Bool) async -> BuiltMap {
         let coords = geometry.coords
         let origin = coords.first ?? CLLocationCoordinate2D(latitude: 0, longitude: 0)
         let proj = LocalProjection(origin: origin)
@@ -50,7 +50,7 @@ enum MapBuilder {
         }
 
         var roads: [RoadLine] = []
-        if let fetched = try? await OverpassClient.fetchRoads(along: coords, total: geometry.total) {
+        if withRoads, let fetched = try? await OverpassClient.fetchRoads(along: coords, total: geometry.total) {
             roads = fetched.compactMap { way in
                 let pts = way.points.map { c -> (Double, Double) in
                     let p = proj.project(c)
@@ -196,23 +196,39 @@ enum OverpassClient {
 
     static func fetchRoads(along coords: [CLLocationCoordinate2D], total: Double) async throws -> [Way] {
         guard coords.count >= 2 else { return [] }
-        let radius: Int = total < 30_000 ? 300 : (total < 100_000 ? 200 : 120)
-        let spacing = max(120.0, total / 300.0)
-        var samples: [CLLocationCoordinate2D] = [coords[0]]
+        let radius: Double = total < 30_000 ? 300 : (total < 100_000 ? 200 : 120)
+        let pieceLength = max(1_500.0, total / 80.0)
+        var boxes: [String] = []
+        var minLat = coords[0].latitude, maxLat = minLat, minLon = coords[0].longitude, maxLon = minLon
         var acc = 0.0
+        func flush() {
+            let mid = (minLat + maxLat) / 2
+            let dLat = radius / 110_540.0
+            let dLon = radius / (111_320.0 * cos(mid * .pi / 180))
+            boxes.append(String(format: "%.5f,%.5f,%.5f,%.5f", minLat - dLat, minLon - dLon, maxLat + dLat, maxLon + dLon))
+        }
         for i in 1..<coords.count {
-            acc += Geo.distance(coords[i - 1], coords[i])
-            if acc >= spacing {
-                samples.append(coords[i])
+            let c = coords[i]
+            acc += Geo.distance(coords[i - 1], c)
+            minLat = min(minLat, c.latitude)
+            maxLat = max(maxLat, c.latitude)
+            minLon = min(minLon, c.longitude)
+            maxLon = max(maxLon, c.longitude)
+            if acc >= pieceLength {
+                flush()
                 acc = 0
+                minLat = c.latitude
+                maxLat = c.latitude
+                minLon = c.longitude
+                maxLon = c.longitude
             }
         }
-        if let last = coords.last { samples.append(last) }
-        let line = samples.map { String(format: "%.5f,%.5f", $0.latitude, $0.longitude) }.joined(separator: ",")
+        flush()
         let filter = total < 100_000
             ? "^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"
             : "^(motorway|trunk|primary|secondary|tertiary|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"
-        let query = "[out:json][timeout:60];way[\"highway\"~\"\(filter)\"](around:\(radius),\(line));out geom qt;"
+        let parts = boxes.map { "way[\"highway\"~\"\(filter)\"](\($0));" }.joined()
+        let query = "[out:json][timeout:25];(\(parts));out geom qt;"
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-._~")
         let body = "data=" + (query.addingPercentEncoding(withAllowedCharacters: allowed) ?? "")
@@ -220,7 +236,7 @@ enum OverpassClient {
         var lastError: Error = URLError(.badServerResponse)
         for endpoint in endpoints {
             guard let url = URL(string: endpoint) else { continue }
-            var req = URLRequest(url: url, timeoutInterval: 75)
+            var req = URLRequest(url: url, timeoutInterval: 30)
             req.httpMethod = "POST"
             req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
             req.setValue("MotoNav/1.0 (iOS; uso pessoal)", forHTTPHeaderField: "User-Agent")

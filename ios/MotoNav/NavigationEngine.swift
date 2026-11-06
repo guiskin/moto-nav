@@ -112,28 +112,40 @@ final class NavigationEngine: ObservableObject {
         guard let g = geometry else { return }
         mapTask?.cancel()
         let version = geometryVersion
-        nextMapId = nextMapId == UInt16.max ? 1 : nextMapId + 1
-        let id = nextMapId
-        mapStatus = "Baixando mapa..."
+        mapStatus = "Baixando ruas..."
         mapTask = Task { [weak self] in
-            let built = await MapBuilder.build(id: id, geometry: g)
-            guard let self = self, !Task.isCancelled, self.geometryVersion == version, self.mode == .navigating else { return }
-            self.latestMap = built
+            guard let self = self else { return }
+            let quick = await MapBuilder.build(id: self.takeMapId(), geometry: g, withRoads: false)
+            guard !Task.isCancelled, self.geometryVersion == version, self.mode == .navigating else { return }
+            self.latestMap = quick
+            self.latestMapVersion = version
+            self.uploadLatestMap()
+            let full = await MapBuilder.build(id: self.takeMapId(), geometry: g, withRoads: true)
+            guard !Task.isCancelled, self.geometryVersion == version, self.mode == .navigating else { return }
+            if full.roadCount == 0 {
+                self.mapStatus = "Sem dados de ruas (verifique a internet)"
+                return
+            }
+            self.latestMap = full
             self.latestMapVersion = version
             self.uploadLatestMap()
         }
     }
 
+    private func takeMapId() -> UInt16 {
+        nextMapId = nextMapId == UInt16.max ? 1 : nextMapId + 1
+        return nextMapId
+    }
+
     private func uploadLatestMap() {
         guard mode == .navigating, let built = latestMap, latestMapVersion == geometryVersion, let ble = ble, ble.isConnected else { return }
         let version = latestMapVersion
-        mapStatus = "Enviando mapa..."
         ble.sendMap(id: built.id, blob: built.blob) { [weak self] in
             Task { @MainActor in
                 guard let self = self, self.geometryVersion == version else { return }
                 self.activeMap = built
                 self.activeMapVersion = version
-                self.mapStatus = built.roadCount == 0 ? "Mapa só com a rota (sem dados de ruas)" : nil
+                if built.roadCount > 0 { self.mapStatus = nil }
                 if let fix = self.lastFix { self.handle(location: fix, simulated: self.simulating) }
             }
         }
