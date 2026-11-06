@@ -14,6 +14,10 @@ struct LocalProjection {
     func project(_ c: CLLocationCoordinate2D) -> (x: Double, y: Double) {
         ((c.longitude - origin.longitude) * kx, (c.latitude - origin.latitude) * ky)
     }
+
+    func unproject(x: Double, y: Double) -> CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: origin.latitude + y / ky, longitude: origin.longitude + x / kx)
+    }
 }
 
 struct RoadLine {
@@ -21,23 +25,16 @@ struct RoadLine {
     var points: [(Int32, Int32)]
 }
 
-struct BuiltMap {
-    let id: UInt16
-    let projection: LocalProjection
-    let routeLocalCum: [Double]
-    let blob: Data
-    let roadCount: Int
+struct RouteBlob {
+    let data: Data
+    let localCum: [Double]
 }
 
 enum MapBuilder {
-    static func build(id: UInt16, geometry: RouteGeometry, withRoads: Bool) async -> BuiltMap {
-        let coords = geometry.coords
-        let origin = coords.first ?? CLLocationCoordinate2D(latitude: 0, longitude: 0)
-        let proj = LocalProjection(origin: origin)
-
+    static func routeBlob(session: UInt16, projection proj: LocalProjection, geometry: RouteGeometry) -> RouteBlob {
         var routePts: [(Int32, Int32)] = []
         var cum: [Double] = []
-        for c in coords {
+        for c in geometry.coords {
             let p = proj.project(c)
             let q = (Int32(p.x.rounded()), Int32(p.y.rounded()))
             if let last = routePts.last {
@@ -48,38 +45,22 @@ enum MapBuilder {
             }
             routePts.append(q)
         }
-
-        var roads: [RoadLine] = []
-        if withRoads, let fetched = try? await OverpassClient.fetchRoads(along: coords, total: geometry.total) {
-            roads = fetched.compactMap { way in
-                let pts = way.points.map { c -> (Double, Double) in
-                    let p = proj.project(c)
-                    return (p.x, p.y)
-                }
-                let simple = simplify(pts, tolerance: 2.0)
-                guard simple.count >= 2 else { return nil }
-                return RoadLine(kind: way.kind, points: simple.map { (Int32($0.0.rounded()), Int32($0.1.rounded())) })
-            }
-            roads = cap(roads, maxPoints: 120_000)
-        }
-
-        let lines = [RoadLine(kind: 0, points: routePts)] + roads
-        let blob = encode(lines)
-        return BuiltMap(id: id, projection: proj, routeLocalCum: cum, blob: blob, roadCount: roads.count)
+        var d = Data("MNR2".utf8)
+        append(&d, session)
+        d.append(encodeLines([RoadLine(kind: 0, points: routePts)]))
+        return RouteBlob(data: d, localCum: cum)
     }
 
-    private static func cap(_ roads: [RoadLine], maxPoints: Int) -> [RoadLine] {
-        var r = roads
-        var total = r.reduce(0) { $0 + $1.points.count }
-        for dropKind: UInt8 in [4, 3] where total > maxPoints {
-            r.removeAll { $0.kind == dropKind }
-            total = r.reduce(0) { $0 + $1.points.count }
-        }
-        return r
+    static func tileBlob(session: UInt16, tx: Int16, ty: Int16, lines: [RoadLine]) -> Data {
+        var d = Data("MNT2".utf8)
+        append(&d, session)
+        append(&d, UInt16(bitPattern: tx))
+        append(&d, UInt16(bitPattern: ty))
+        d.append(encodeLines(lines))
+        return d
     }
 
-    static func encode(_ lines: [RoadLine]) -> Data {
-        var d = Data("MNM1".utf8)
+    static func encodeLines(_ lines: [RoadLine]) -> Data {
         var out: [RoadLine] = []
         for line in lines {
             var pts: [(Int32, Int32)] = []
@@ -104,6 +85,7 @@ enum MapBuilder {
             }
         }
         if out.count > 65_000 { out = Array(out.prefix(65_000)) }
+        var d = Data()
         append(&d, UInt16(out.count))
         for line in out {
             d.append(line.kind)
@@ -120,7 +102,7 @@ enum MapBuilder {
         return d
     }
 
-    private static func append<T: FixedWidthInteger>(_ d: inout Data, _ v: T) {
+    static func append<T: FixedWidthInteger>(_ d: inout Data, _ v: T) {
         withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) }
     }
 
@@ -165,6 +147,13 @@ enum OverpassClient {
         let points: [CLLocationCoordinate2D]
     }
 
+    struct BBox {
+        let south: Double
+        let west: Double
+        let north: Double
+        let east: Double
+    }
+
     private struct Response: Decodable {
         struct Element: Decodable {
             struct LatLon: Decodable {
@@ -189,45 +178,18 @@ enum OverpassClient {
         case "motorway", "trunk", "motorway_link", "trunk_link": return 1
         case "primary", "secondary", "primary_link", "secondary_link": return 2
         case "tertiary", "tertiary_link", "unclassified": return 3
-        case "residential", "living_street": return 4
+        case "residential", "living_street", "road": return 4
         default: return nil
         }
     }
 
-    static func fetchRoads(along coords: [CLLocationCoordinate2D], total: Double) async throws -> [Way] {
-        guard coords.count >= 2 else { return [] }
-        let radius: Double = total < 30_000 ? 300 : (total < 100_000 ? 200 : 120)
-        let pieceLength = max(1_500.0, total / 80.0)
-        var boxes: [String] = []
-        var minLat = coords[0].latitude, maxLat = minLat, minLon = coords[0].longitude, maxLon = minLon
-        var acc = 0.0
-        func flush() {
-            let mid = (minLat + maxLat) / 2
-            let dLat = radius / 110_540.0
-            let dLon = radius / (111_320.0 * cos(mid * .pi / 180))
-            boxes.append(String(format: "%.5f,%.5f,%.5f,%.5f", minLat - dLat, minLon - dLon, maxLat + dLat, maxLon + dLon))
-        }
-        for i in 1..<coords.count {
-            let c = coords[i]
-            acc += Geo.distance(coords[i - 1], c)
-            minLat = min(minLat, c.latitude)
-            maxLat = max(maxLat, c.latitude)
-            minLon = min(minLon, c.longitude)
-            maxLon = max(maxLon, c.longitude)
-            if acc >= pieceLength {
-                flush()
-                acc = 0
-                minLat = c.latitude
-                maxLat = c.latitude
-                minLon = c.longitude
-                maxLon = c.longitude
-            }
-        }
-        flush()
-        let filter = total < 100_000
-            ? "^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"
-            : "^(motorway|trunk|primary|secondary|tertiary|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"
-        let parts = boxes.map { "way[\"highway\"~\"\(filter)\"](\($0));" }.joined()
+    static func fetchWays(in boxes: [BBox]) async throws -> [Way] {
+        guard !boxes.isEmpty else { return [] }
+        let filter = "^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|road|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"
+        let parts = boxes.map { b -> String in
+            let box = String(format: "%.5f,%.5f,%.5f,%.5f", b.south, b.west, b.north, b.east)
+            return "way[\"highway\"~\"\(filter)\"](\(box));"
+        }.joined()
         let query = "[out:json][timeout:25];(\(parts));out geom qt;"
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-._~")

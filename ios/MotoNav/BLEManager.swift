@@ -21,6 +21,8 @@ final class BLEManager: NSObject, ObservableObject {
     private var bulkQueue: [Data] = []
     private var bulkTotal = 0
     private var bulkDone: (() -> Void)?
+    private var pendingBlobs: [(data: Data, done: (() -> Void)?)] = []
+    private var blobId: UInt16 = 1
 
     override init() {
         super.init()
@@ -52,8 +54,22 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
-    func sendMap(id: UInt16, blob: Data, completion: (() -> Void)? = nil) {
+    func sendMap(blob: Data, priority: Bool, completion: (() -> Void)? = nil) {
         guard isConnected, mapChar != nil else { return }
+        if priority {
+            pendingBlobs.insert((data: blob, done: completion), at: 0)
+        } else {
+            pendingBlobs.append((data: blob, done: completion))
+        }
+        startNextBlob()
+    }
+
+    private func startNextBlob() {
+        guard bulkQueue.isEmpty, bulkTotal == 0, !pendingBlobs.isEmpty else { return }
+        let next = pendingBlobs.removeFirst()
+        let blob = next.data
+        blobId = blobId == UInt16.max ? 1 : blobId + 1
+        let id = blobId
         var packets: [Data] = []
         var begin = Data([0x10])
         append(&begin, id)
@@ -75,7 +91,7 @@ final class BLEManager: NSObject, ObservableObject {
         packets.append(endPkt)
         bulkQueue = packets
         bulkTotal = packets.count
-        bulkDone = completion
+        bulkDone = next.done
         uploadProgress = 0
         pump()
     }
@@ -94,6 +110,7 @@ final class BLEManager: NSObject, ObservableObject {
             let done = bulkDone
             bulkDone = nil
             done?()
+            startNextBlob()
         }
     }
 
@@ -132,6 +149,7 @@ final class BLEManager: NSObject, ObservableObject {
         bulkQueue = []
         bulkTotal = 0
         bulkDone = nil
+        pendingBlobs = []
         uploadProgress = nil
     }
 

@@ -109,18 +109,38 @@ struct Chunk {
   uint8_t kind;
 };
 
-struct MapData {
-  bool ready;
-  uint16_t id;
+struct Lines {
   int32_t *px;
   int32_t *py;
   uint32_t nPts;
   Chunk *chunks;
   uint32_t nChunks;
+  uint32_t kindStart[6];
+  int32_t minX, minY, maxX, maxY;
+};
+
+struct RouteData {
+  Lines lines;
   float *rx;
   float *ry;
   float *rcum;
-  uint32_t nRoute;
+  uint32_t n;
+};
+
+#define MAX_TILES 48
+
+struct Tile {
+  bool used;
+  int16_t tx;
+  int16_t ty;
+  Lines lines;
+};
+
+struct World {
+  bool hasSession;
+  uint16_t session;
+  RouteData route;
+  Tile tiles[MAX_TILES];
 };
 
 struct View {
@@ -151,7 +171,7 @@ QueueHandle_t rxQueue;
 NavData navShared = {};
 GpsData gpsShared = {};
 PosTarget posShared = {};
-MapData mapData = {};
+World world = {};
 volatile uint32_t lastNavMs = 0;
 volatile bool navDirty = true;
 volatile bool bleConnected = false;
@@ -227,60 +247,63 @@ static inline uint32_t rd32(const uint8_t *p) {
   return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-void freeMap(MapData &m) {
-  if (m.px) heap_caps_free(m.px);
-  if (m.py) heap_caps_free(m.py);
-  if (m.chunks) heap_caps_free(m.chunks);
-  if (m.rx) heap_caps_free(m.rx);
-  if (m.ry) heap_caps_free(m.ry);
-  if (m.rcum) heap_caps_free(m.rcum);
-  m = {};
+void freeLines(Lines &l) {
+  if (l.px) heap_caps_free(l.px);
+  if (l.py) heap_caps_free(l.py);
+  if (l.chunks) heap_caps_free(l.chunks);
+  l = {};
+}
+
+void freeRoute(RouteData &r) {
+  freeLines(r.lines);
+  if (r.rx) heap_caps_free(r.rx);
+  if (r.ry) heap_caps_free(r.ry);
+  if (r.rcum) heap_caps_free(r.rcum);
+  r = {};
 }
 
 void *psAlloc(size_t bytes) {
   return heap_caps_malloc(bytes > 0 ? bytes : 4, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
-int drawOrder(uint8_t kind) {
-  switch (kind) {
-    case 4: return 0;
-    case 3: return 1;
-    case 2: return 2;
-    case 1: return 3;
-    case 0: return 5;
-    default: return 0;
-  }
-}
-
-bool parseMap(const uint8_t *b, uint32_t len, uint16_t id, MapData &m) {
-  if (len < 6 || memcmp(b, "MNM1", 4) != 0) return false;
-  uint16_t count = rd16(b + 4);
-  uint32_t off = 6;
+bool parseLines(const uint8_t *b, uint32_t len, uint32_t off, Lines &out, RouteData *route) {
+  if (off + 2 > len) return false;
+  uint16_t count = rd16(b + off);
+  off += 2;
+  uint32_t start = off;
   uint32_t totalPts = 0, totalChunks = 0, routePts = 0;
   for (uint16_t i = 0; i < count; i++) {
     if (off + 11 > len) return false;
     uint8_t kind = b[off];
     uint16_t n = rd16(b + off + 1);
     uint32_t need = 11 + (uint32_t)(n > 0 ? n - 1 : 0) * 4;
-    if (n == 0 || off + need > len) return false;
+    if (n == 0 || off + need > len || kind > 4) return false;
     totalPts += n;
     if (n >= 2) totalChunks += (n - 2) / (CHUNK_PTS - 1) + 1;
     if (kind == 0 && routePts == 0) routePts = n;
     off += need;
   }
-  MapData r = {};
-  r.id = id;
+  Lines r = {};
   r.px = (int32_t *)psAlloc(totalPts * sizeof(int32_t));
   r.py = (int32_t *)psAlloc(totalPts * sizeof(int32_t));
   r.chunks = (Chunk *)psAlloc(totalChunks * sizeof(Chunk));
-  r.rx = (float *)psAlloc(routePts * sizeof(float));
-  r.ry = (float *)psAlloc(routePts * sizeof(float));
-  r.rcum = (float *)psAlloc(routePts * sizeof(float));
-  if (!r.px || !r.py || !r.chunks || !r.rx || !r.ry || !r.rcum) {
-    freeMap(r);
+  if (!r.px || !r.py || !r.chunks) {
+    freeLines(r);
     return false;
   }
-  off = 6;
+  if (route) {
+    route->rx = (float *)psAlloc(routePts * sizeof(float));
+    route->ry = (float *)psAlloc(routePts * sizeof(float));
+    route->rcum = (float *)psAlloc(routePts * sizeof(float));
+    if (!route->rx || !route->ry || !route->rcum) {
+      freeLines(r);
+      freeRoute(*route);
+      return false;
+    }
+  }
+  r.minX = r.minY = INT32_MAX;
+  r.maxX = r.maxY = INT32_MIN;
+  off = start;
   uint32_t pi = 0, ci = 0;
   bool routeDone = false;
   for (uint16_t i = 0; i < count; i++) {
@@ -290,36 +313,39 @@ bool parseMap(const uint8_t *b, uint32_t len, uint16_t id, MapData &m) {
     int32_t y = (int32_t)rd32(b + off + 7);
     off += 11;
     uint32_t base = pi;
-    r.px[pi] = x;
-    r.py[pi] = y;
-    pi++;
-    for (uint16_t k = 1; k < n; k++) {
-      x += (int16_t)rd16(b + off);
-      y += (int16_t)rd16(b + off + 2);
-      off += 4;
+    for (uint16_t k = 0; k < n; k++) {
+      if (k > 0) {
+        x += (int16_t)rd16(b + off);
+        y += (int16_t)rd16(b + off + 2);
+        off += 4;
+      }
       r.px[pi] = x;
       r.py[pi] = y;
+      if (x < r.minX) r.minX = x;
+      if (x > r.maxX) r.maxX = x;
+      if (y < r.minY) r.minY = y;
+      if (y > r.maxY) r.maxY = y;
       pi++;
     }
-    if (kind == 0 && !routeDone) {
+    if (route && kind == 0 && !routeDone) {
       routeDone = true;
-      r.nRoute = n;
+      route->n = n;
       float cum = 0;
       for (uint16_t k = 0; k < n; k++) {
-        r.rx[k] = r.px[base + k];
-        r.ry[k] = r.py[base + k];
+        route->rx[k] = r.px[base + k];
+        route->ry[k] = r.py[base + k];
         if (k > 0) {
-          float dx = r.rx[k] - r.rx[k - 1], dy = r.ry[k] - r.ry[k - 1];
+          float dx = route->rx[k] - route->rx[k - 1], dy = route->ry[k] - route->ry[k - 1];
           cum += sqrtf(dx * dx + dy * dy);
         }
-        r.rcum[k] = cum;
+        route->rcum[k] = cum;
       }
     }
     if (n < 2) continue;
-    for (uint32_t s = 0; s + 1 < n; s += CHUNK_PTS - 1) {
-      uint32_t cnt = min<uint32_t>(CHUNK_PTS, n - s);
+    for (uint32_t st = 0; st + 1 < n; st += CHUNK_PTS - 1) {
+      uint32_t cnt = min<uint32_t>(CHUNK_PTS, n - st);
       Chunk &c = r.chunks[ci++];
-      c.start = base + s;
+      c.start = base + st;
       c.count = cnt;
       c.kind = kind;
       c.minX = c.maxX = r.px[c.start];
@@ -336,11 +362,95 @@ bool parseMap(const uint8_t *b, uint32_t len, uint16_t id, MapData &m) {
   r.nPts = pi;
   r.nChunks = ci;
   std::stable_sort(r.chunks, r.chunks + r.nChunks, [](const Chunk &a, const Chunk &b) {
-    return drawOrder(a.kind) < drawOrder(b.kind);
+    return a.kind < b.kind;
   });
-  r.ready = true;
-  m = r;
+  uint32_t idx = 0;
+  for (uint8_t k = 0; k < 6; k++) {
+    while (idx < r.nChunks && r.chunks[idx].kind < k) idx++;
+    r.kindStart[k] = idx;
+  }
+  r.kindStart[5] = r.nChunks;
+  out = r;
   return true;
+}
+
+void clearWorldLocked() {
+  freeRoute(world.route);
+  for (int i = 0; i < MAX_TILES; i++) {
+    if (world.tiles[i].used) freeLines(world.tiles[i].lines);
+    world.tiles[i] = {};
+  }
+  world.hasSession = false;
+}
+
+struct Camera {
+  bool init;
+  float x, y, along, heading, mpp;
+  uint32_t lastMs;
+} cam = {};
+
+void applyBlob(const uint8_t *b, uint32_t len) {
+  if (len < 8) return;
+  bool isRoute = memcmp(b, "MNR2", 4) == 0;
+  bool isTile = memcmp(b, "MNT2", 4) == 0;
+  if (!isRoute && !isTile) return;
+  uint16_t session = rd16(b + 4);
+  if (isRoute) {
+    RouteData fresh = {};
+    if (!parseLines(b, len, 6, fresh.lines, &fresh)) return;
+    xSemaphoreTake(mapMutex, portMAX_DELAY);
+    if (!world.hasSession || world.session != session) {
+      clearWorldLocked();
+      world.hasSession = true;
+      world.session = session;
+      cam.init = false;
+    }
+    RouteData old = world.route;
+    world.route = fresh;
+    xSemaphoreGive(mapMutex);
+    freeRoute(old);
+    return;
+  }
+  if (len < 12) return;
+  int16_t tx = (int16_t)rd16(b + 6);
+  int16_t ty = (int16_t)rd16(b + 8);
+  Lines fresh = {};
+  if (!parseLines(b, len, 10, fresh, nullptr)) return;
+  xSemaphoreTake(mapMutex, portMAX_DELAY);
+  if (!world.hasSession || world.session != session) {
+    clearWorldLocked();
+    world.hasSession = true;
+    world.session = session;
+    cam.init = false;
+  }
+  int slot = -1;
+  for (int i = 0; i < MAX_TILES; i++) {
+    if (world.tiles[i].used && world.tiles[i].tx == tx && world.tiles[i].ty == ty) slot = i;
+  }
+  if (slot < 0) {
+    for (int i = 0; i < MAX_TILES && slot < 0; i++) {
+      if (!world.tiles[i].used) slot = i;
+    }
+  }
+  if (slot < 0) {
+    float best = -1;
+    for (int i = 0; i < MAX_TILES; i++) {
+      const Lines &l = world.tiles[i].lines;
+      float cx = (l.minX + l.maxX) * 0.5f - cam.x, cy = (l.minY + l.maxY) * 0.5f - cam.y;
+      float d = cx * cx + cy * cy;
+      if (d > best) {
+        best = d;
+        slot = i;
+      }
+    }
+  }
+  Lines old = world.tiles[slot].used ? world.tiles[slot].lines : Lines{};
+  world.tiles[slot].used = true;
+  world.tiles[slot].tx = tx;
+  world.tiles[slot].ty = ty;
+  world.tiles[slot].lines = fresh;
+  xSemaphoreGive(mapMutex);
+  freeLines(old);
 }
 
 void handleNavPacket(const uint8_t *p, size_t n) {
@@ -408,19 +518,9 @@ void handleMapPacket(const uint8_t *p, size_t n) {
       mapProgress = -1;
       return;
     }
-    MapData fresh = {};
-    bool ok = parseMap(rxBuf, rxTotal, id, fresh);
+    applyBlob(rxBuf, rxTotal);
     heap_caps_free(rxBuf);
     rxBuf = nullptr;
-    if (!ok) {
-      mapProgress = -1;
-      return;
-    }
-    xSemaphoreTake(mapMutex, portMAX_DELAY);
-    MapData old = mapData;
-    mapData = fresh;
-    xSemaphoreGive(mapMutex);
-    freeMap(old);
     mapProgress = 100;
   }
 }
@@ -821,11 +921,11 @@ void drawMapOverlay(const NavData &n, float speedKmh) {
   textCentered(b, 438, u8g2_font_helvB18_tf, C_FG);
 }
 
-float routePointAt(const MapData &m, float along, float &x, float &y) {
-  if (m.nRoute < 2) return 0;
-  float total = m.rcum[m.nRoute - 1];
+float routePointAt(const RouteData &m, float along, float &x, float &y) {
+  if (m.n < 2) return 0;
+  float total = m.rcum[m.n - 1];
   float d = constrain(along, 0.0f, total);
-  uint32_t lo = 0, hi = m.nRoute - 1;
+  uint32_t lo = 0, hi = m.n - 1;
   while (hi - lo > 1) {
     uint32_t mid = (lo + hi) / 2;
     if (m.rcum[mid] <= d) lo = mid;
@@ -838,7 +938,7 @@ float routePointAt(const MapData &m, float along, float &x, float &y) {
   return total;
 }
 
-float routeBearingAt(const MapData &m, float along) {
+float routeBearingAt(const RouteData &m, float along) {
   float x0, y0, x1, y1;
   routePointAt(m, along - 8, x0, y0);
   routePointAt(m, along + 15, x1, y1);
@@ -851,19 +951,13 @@ float wrap180(float a) {
   return a;
 }
 
-struct Camera {
-  bool init;
-  float x, y, along, heading, mpp;
-  uint32_t lastMs;
-} cam = {};
-
-void updateCamera(const MapData &m, const PosTarget &t, uint32_t now) {
+void updateCamera(const RouteData &m, const PosTarget &t, uint32_t now) {
   float dt = cam.init ? (now - cam.lastMs) / 1000.0f : 0;
   dt = constrain(dt, 0.0f, 0.2f);
   cam.lastMs = now;
   float age = constrain((now - t.ms) / 1000.0f, 0.0f, 3.0f);
   float targetHeading = cam.heading;
-  bool onRoute = t.along >= 0 && m.nRoute >= 2;
+  bool onRoute = t.along >= 0 && m.n >= 2;
   if (onRoute) {
     float predicted = t.along + t.speed * age;
     if (!cam.init || fabsf(predicted - cam.along) > 80) {
@@ -900,11 +994,36 @@ void updateCamera(const MapData &m, const PosTarget &t, uint32_t now) {
   }
 }
 
+void drawChunks(const View &v, const Lines &l, uint8_t kind, float R) {
+  if (l.nChunks == 0) return;
+  if (l.maxX < v.px - R || l.minX > v.px + R || l.maxY < v.py - R || l.minY > v.py + R) return;
+  float w;
+  uint16_t col;
+  if (kind == 0) {
+    w = constrain(14.0f / v.mpp, 8.0f, 16.0f);
+    col = C_ROUTE;
+  } else {
+    roadStyle(kind, v.mpp, w, col);
+  }
+  for (uint32_t ci = l.kindStart[kind]; ci < l.kindStart[kind + 1]; ci++) {
+    const Chunk &c = l.chunks[ci];
+    if (c.maxX < v.px - R || c.minX > v.px + R || c.maxY < v.py - R || c.minY > v.py + R) continue;
+    float ax, ay;
+    toScreen(v, l.px[c.start], l.py[c.start], ax, ay);
+    for (uint16_t k = 1; k < c.count; k++) {
+      float bx, by;
+      toScreen(v, l.px[c.start + k], l.py[c.start + k], bx, by);
+      wideSeg(ax, ay, bx, by, w, col, w >= 5);
+      ax = bx;
+      ay = by;
+    }
+  }
+}
+
 void drawMapScreen(const NavData &n, const PosTarget &t, uint32_t now) {
   gfx->fillScreen(C_MAP_BG);
   xSemaphoreTake(mapMutex, portMAX_DELAY);
-  const MapData &m = mapData;
-  updateCamera(m, t, now);
+  updateCamera(world.route, t, now);
   View v;
   v.px = cam.x;
   v.py = cam.y;
@@ -913,28 +1032,13 @@ void drawMapScreen(const NavData &n, const PosTarget &t, uint32_t now) {
   v.sinH = sinf(h);
   v.mpp = cam.mpp;
   float R = 400 * v.mpp;
-  for (uint32_t ci = 0; ci < m.nChunks; ci++) {
-    const Chunk &c = m.chunks[ci];
-    if (c.maxX < v.px - R || c.minX > v.px + R || c.maxY < v.py - R || c.minY > v.py + R) continue;
-    float w;
-    uint16_t col;
-    bool isRoute = c.kind == 0;
-    if (isRoute) {
-      w = constrain(14.0f / v.mpp, 8.0f, 16.0f);
-      col = C_ROUTE;
-    } else {
-      roadStyle(c.kind, v.mpp, w, col);
-    }
-    float ax, ay;
-    toScreen(v, m.px[c.start], m.py[c.start], ax, ay);
-    for (uint16_t k = 1; k < c.count; k++) {
-      float bx, by;
-      toScreen(v, m.px[c.start + k], m.py[c.start + k], bx, by);
-      wideSeg(ax, ay, bx, by, w, col, w >= 5);
-      ax = bx;
-      ay = by;
+  const uint8_t order[4] = { 4, 3, 2, 1 };
+  for (uint8_t oi = 0; oi < 4; oi++) {
+    for (int i = 0; i < MAX_TILES; i++) {
+      if (world.tiles[i].used) drawChunks(v, world.tiles[i].lines, order[oi], R);
     }
   }
+  drawChunks(v, world.route.lines, 0, R);
   xSemaphoreGive(mapMutex);
   drawPositionMarker();
   drawMapOverlay(n, t.speed * 3.6f);
@@ -1020,7 +1124,7 @@ void loop() {
   portENTER_CRITICAL(&posMux);
   t = posShared;
   portEXIT_CRITICAL(&posMux);
-  bool mapReady = mapData.ready && t.valid && t.mapId == mapData.id && (now - t.ms) < 10000;
+  bool mapReady = world.hasSession && t.valid && t.mapId == world.session && (now - t.ms) < 10000;
   bool animating = navOn && showMap && mapReady;
 
   uint32_t interval = animating ? 40 : (navOn ? 250 : 1000);

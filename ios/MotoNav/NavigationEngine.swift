@@ -43,18 +43,18 @@ final class NavigationEngine: ObservableObject {
     private var heartbeat: Timer?
     private var lastFix: CLLocation?
     private var geometryVersion = 0
-    private var latestMap: BuiltMap?
-    private var latestMapVersion = -1
-    private var activeMap: BuiltMap?
-    private var activeMapVersion = -1
-    private var nextMapId = UInt16.random(in: 1...60_000)
-    private var mapTask: Task<Void, Never>?
+    private var session: UInt16 = 0
+    private var projection: LocalProjection?
+    private var tiles: TileManager?
+    private var routeBlob: RouteBlob?
+    private var routeBlobVersion = -1
+    private var routeOnBoardVersion = -1
 
     func attach(location: LocationProvider, ble: BLEManager) {
         self.location = location
         self.ble = ble
         ble.onReady = { [weak self] in
-            Task { @MainActor in self?.uploadLatestMap() }
+            Task { @MainActor in self?.boardReconnected() }
         }
         location.onUpdate = { [weak self] loc in
             Task { @MainActor in self?.handle(location: loc, simulated: false) }
@@ -105,50 +105,67 @@ final class NavigationEngine: ObservableObject {
         geometryVersion += 1
         segmentHint = nil
         offRouteCount = 0
-        if mode == .navigating { rebuildMap() }
+        if mode == .navigating { uploadRoute() }
     }
 
-    private func rebuildMap() {
+    private func startSession() {
         guard let g = geometry else { return }
-        mapTask?.cancel()
-        let version = geometryVersion
-        mapStatus = "Baixando ruas..."
-        mapTask = Task { [weak self] in
-            guard let self = self else { return }
-            let quick = await MapBuilder.build(id: self.takeMapId(), geometry: g, withRoads: false)
-            guard !Task.isCancelled, self.geometryVersion == version, self.mode == .navigating else { return }
-            self.latestMap = quick
-            self.latestMapVersion = version
-            self.uploadLatestMap()
-            let full = await MapBuilder.build(id: self.takeMapId(), geometry: g, withRoads: true)
-            guard !Task.isCancelled, self.geometryVersion == version, self.mode == .navigating else { return }
-            if full.roadCount == 0 {
-                self.mapStatus = "Sem dados de ruas (verifique a internet)"
-                return
-            }
-            self.latestMap = full
-            self.latestMapVersion = version
-            self.uploadLatestMap()
+        session = UInt16.random(in: 1...65_000)
+        let origin = g.coords.first ?? location?.location?.coordinate ?? CLLocationCoordinate2D(latitude: 0, longitude: 0)
+        let proj = LocalProjection(origin: origin)
+        projection = proj
+        let tm = TileManager(session: session, projection: proj)
+        tm.upload = { [weak self] data in self?.ble?.sendMap(blob: data, priority: false) }
+        tm.onStatus = { [weak self] text in self?.mapStatus = text }
+        tiles = tm
+        uploadRoute()
+        if let fix = location?.location {
+            updateTiles(fix)
+        } else if let first = g.coords.first {
+            updateTiles(CLLocation(latitude: first.latitude, longitude: first.longitude))
         }
     }
 
-    private func takeMapId() -> UInt16 {
-        nextMapId = nextMapId == UInt16.max ? 1 : nextMapId + 1
-        return nextMapId
+    private func uploadRoute() {
+        guard let g = geometry, let proj = projection else { return }
+        routeBlob = MapBuilder.routeBlob(session: session, projection: proj, geometry: g)
+        routeBlobVersion = geometryVersion
+        sendRoute()
     }
 
-    private func uploadLatestMap() {
-        guard mode == .navigating, let built = latestMap, latestMapVersion == geometryVersion, let ble = ble, ble.isConnected else { return }
-        let version = latestMapVersion
-        ble.sendMap(id: built.id, blob: built.blob) { [weak self] in
+    private func sendRoute() {
+        guard mode == .navigating, let rb = routeBlob, let ble = ble, ble.isConnected else { return }
+        let version = routeBlobVersion
+        ble.sendMap(blob: rb.data, priority: true) { [weak self] in
             Task { @MainActor in
-                guard let self = self, self.geometryVersion == version else { return }
-                self.activeMap = built
-                self.activeMapVersion = version
-                if built.roadCount > 0 { self.mapStatus = nil }
-                if let fix = self.lastFix { self.handle(location: fix, simulated: self.simulating) }
+                guard let self = self else { return }
+                self.routeOnBoardVersion = version
+                self.resendPosition()
             }
         }
+    }
+
+    private func boardReconnected() {
+        guard mode == .navigating else { return }
+        routeOnBoardVersion = -1
+        sendRoute()
+        tiles?.resetSent()
+        if let fix = lastFix { updateTiles(fix) }
+    }
+
+    private func updateTiles(_ loc: CLLocation) {
+        guard let tm = tiles, let proj = projection else { return }
+        let p = proj.project(loc.coordinate)
+        var ahead: [(x: Double, y: Double)] = []
+        if let g = geometry, let pr = g.project(loc.coordinate, near: segmentHint), pr.offRoute < 200 {
+            var d = pr.along + 400
+            while d <= min(pr.along + 3_000, g.total) {
+                let q = proj.project(g.point(at: d))
+                ahead.append((x: q.x, y: q.y))
+                d += 400
+            }
+        }
+        tm.update(position: (x: p.x, y: p.y), ahead: ahead)
     }
 
     private func resendPosition() {
@@ -157,12 +174,12 @@ final class NavigationEngine: ObservableObject {
     }
 
     private func sendPosition(_ loc: CLLocation, projection proj: RouteGeometry.Projection?, geometry g: RouteGeometry) {
-        guard let ble = ble, let map = activeMap else { return }
-        let p = map.projection.project(loc.coordinate)
+        guard let ble = ble, let local = projection else { return }
+        let p = local.project(loc.coordinate)
         var along: Int32 = -1
-        if let proj = proj, activeMapVersion == geometryVersion, proj.offRoute < 30 {
+        if let proj = proj, let rb = routeBlob, routeOnBoardVersion == geometryVersion, routeBlobVersion == geometryVersion, proj.offRoute < 30 {
             let i = proj.segment
-            let cum = map.routeLocalCum
+            let cum = rb.localCum
             if i + 1 < cum.count && i + 1 < g.cum.count {
                 let segLen = g.cum[i + 1] - g.cum[i]
                 let t = segLen > 0 ? min(max((proj.along - g.cum[i]) / segLen, 0), 1) : 0
@@ -170,7 +187,7 @@ final class NavigationEngine: ObservableObject {
             }
         }
         var d = Data([0x02])
-        appendLE(&d, map.id)
+        appendLE(&d, session)
         appendLE(&d, Int32(clamping: Int((p.x * 10).rounded())))
         appendLE(&d, Int32(clamping: Int((p.y * 10).rounded())))
         let heading: UInt16 = loc.course >= 0 ? UInt16(clamping: Int((loc.course * 100).rounded()) % 36_000) : 0xFFFF
@@ -183,7 +200,7 @@ final class NavigationEngine: ObservableObject {
     func start(simulate: Bool) {
         guard geometry != nil else { return }
         mode = .navigating
-        rebuildMap()
+        startSession()
         location?.setBackground(true)
         UIApplication.shared.isIdleTimerDisabled = true
         if simulate { startSimulation() }
@@ -192,10 +209,11 @@ final class NavigationEngine: ObservableObject {
 
     func stop() {
         stopSimulation()
-        mapTask?.cancel()
-        mapTask = nil
-        latestMap = nil
-        activeMap = nil
+        tiles = nil
+        projection = nil
+        routeBlob = nil
+        routeBlobVersion = -1
+        routeOnBoardVersion = -1
         mapStatus = nil
         mode = .idle
         route = nil
@@ -282,6 +300,7 @@ final class NavigationEngine: ObservableObject {
         snapshot = s
         pushToDevice()
         sendPosition(loc, projection: proj, geometry: g)
+        updateTiles(loc)
     }
 
     private func reroute(from loc: CLLocation) {
