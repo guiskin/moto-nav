@@ -61,7 +61,10 @@ final class NavigationEngine: ObservableObject {
         }
         heartbeat?.invalidate()
         heartbeat = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.pushToDevice() }
+            Task { @MainActor in
+                self?.pushToDevice()
+                self?.resendPosition()
+            }
         }
     }
 
@@ -134,6 +137,11 @@ final class NavigationEngine: ObservableObject {
                 if let fix = self.lastFix { self.handle(location: fix, simulated: self.simulating) }
             }
         }
+    }
+
+    private func resendPosition() {
+        guard mode == .navigating, let loc = lastFix, let g = geometry else { return }
+        sendPosition(loc, projection: g.project(loc.coordinate, near: segmentHint), geometry: g)
     }
 
     private func sendPosition(_ loc: CLLocation, projection proj: RouteGeometry.Projection?, geometry g: RouteGeometry) {
