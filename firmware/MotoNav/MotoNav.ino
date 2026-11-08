@@ -1851,6 +1851,8 @@ void setup() {
   touch.setPins(TP_RESET, TP_INT);
   touchOk = touch.begin(Wire, CST92XX_SLAVE_ADDRESS);
   if (touchOk) {
+    touch.setMaxCoordinates(LCD_W, LCD_H);
+    touch.setMirrorXY(true, true);
     pinMode(TP_INT, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(TP_INT), onTouch, FALLING);
   }
