@@ -27,6 +27,7 @@ final class BLEManager: NSObject, ObservableObject {
     private var otaChar: CBCharacteristic?
     private var bulkTarget: CBCharacteristic?
     private var otaTimeout: DispatchWorkItem?
+    private var retryScheduled = false
     private var lastNavPacket: Data?
     private var bulkQueue: [Data] = []
     private var bulkTotal = 0
@@ -46,11 +47,12 @@ final class BLEManager: NSObject, ObservableObject {
 
     func send(_ data: Data) {
         lastNavPacket = data
+        guard !otaRunning else { return }
         write(data, to: navChar)
     }
 
     func sendPosition(_ data: Data) {
-        guard bulkQueue.isEmpty else { return }
+        guard bulkQueue.isEmpty, !otaRunning else { return }
         write(data, to: navChar)
     }
 
@@ -83,7 +85,7 @@ final class BLEManager: NSObject, ObservableObject {
         otaMessage = "Enviando..."
         pendingBlobs.insert((data: image, ota: true, done: { [weak self] in
             self?.otaMessage = "Gravando na placa..."
-            self?.armOtaTimeout(20)
+            self?.armOtaTimeout(30)
         }), at: 0)
         startNextBlob()
     }
@@ -179,6 +181,13 @@ final class BLEManager: NSObject, ObservableObject {
         guard let p = peripheral, let c = bulkTarget, p.state == .connected else { return }
         while !bulkQueue.isEmpty && p.canSendWriteWithoutResponse {
             p.writeValue(bulkQueue.removeFirst(), for: c, type: .withoutResponse)
+        }
+        if !bulkQueue.isEmpty && !retryScheduled {
+            retryScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.retryScheduled = false
+                self?.pump()
+            }
         }
         if bulkTotal > 0 {
             let progress = Double(bulkTotal - bulkQueue.count) / Double(bulkTotal)

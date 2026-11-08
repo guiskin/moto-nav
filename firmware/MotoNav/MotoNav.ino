@@ -653,64 +653,92 @@ void setInfo(const char *s, bool notify) {
   if (notify && bleConnected) infoChar->notify();
 }
 
+uint8_t *otaBuf = nullptr;
+volatile bool otaWriting = false;
+
+void otaFail(const char *what, int code) {
+  char msg[48];
+  snprintf(msg, sizeof(msg), "ota=err:%s:%d", what, code);
+  if (otaBuf) {
+    heap_caps_free(otaBuf);
+    otaBuf = nullptr;
+  }
+  otaActive = false;
+  otaWriting = false;
+  navDirty = true;
+  setInfo(msg, true);
+}
+
 void handleOtaPacket(const uint8_t *p, size_t n) {
   char msg[40];
   if (p[0] == 0x20 && n >= 5) {
     otaSize = rd32(p + 1);
     otaGot = 0;
-    if (Update.isRunning()) Update.abort();
-    if (otaSize == 0 || !Update.begin(otaSize, U_FLASH)) {
-      otaActive = false;
-      snprintf(msg, sizeof(msg), "ota=err:begin:%d", Update.getError());
-      setInfo(msg, true);
+    if (otaBuf) heap_caps_free(otaBuf);
+    otaBuf = (otaSize > 0 && otaSize < 3000000) ? (uint8_t *)psAlloc(otaSize) : nullptr;
+    if (!otaBuf) {
+      otaFail("mem", (int)otaSize);
       return;
     }
     otaActive = true;
+    otaWriting = false;
     otaProgress = 0;
     navDirty = true;
     setInfo("ota=p:0", true);
   } else if (p[0] == 0x21 && n >= 5) {
-    if (!otaActive) return;
+    if (!otaActive || !otaBuf) return;
     uint32_t off = rd32(p + 1);
-    if (off != otaGot) {
-      Update.abort();
-      otaActive = false;
-      snprintf(msg, sizeof(msg), "ota=err:offset:%lu:%lu", (unsigned long)off, (unsigned long)otaGot);
-      setInfo(msg, true);
-      navDirty = true;
-      return;
-    }
     size_t dl = n - 5;
-    if (Update.write((uint8_t *)p + 5, dl) != dl) {
-      Update.abort();
-      otaActive = false;
-      snprintf(msg, sizeof(msg), "ota=err:write:%d", Update.getError());
-      setInfo(msg, true);
-      navDirty = true;
+    if (off != otaGot || off + dl > otaSize) {
+      otaFail("offset", (int)off);
       return;
     }
+    memcpy(otaBuf + off, p + 5, dl);
     otaGot += dl;
     int pr = otaSize ? (int)((uint64_t)otaGot * 100 / otaSize) : 0;
     if (pr != otaProgress) {
       otaProgress = pr;
       navDirty = true;
-      if (pr % 5 == 0) {
+      if (pr % 10 == 0) {
         snprintf(msg, sizeof(msg), "ota=p:%d", pr);
         setInfo(msg, true);
       }
     }
   } else if (p[0] == 0x22) {
-    if (!otaActive) return;
-    bool ok = otaGot == otaSize && Update.end(true);
-    otaActive = false;
-    navDirty = true;
-    if (!ok) {
-      snprintf(msg, sizeof(msg), "ota=err:end:%d", Update.getError());
-      setInfo(msg, true);
+    if (!otaActive || !otaBuf) return;
+    if (otaGot != otaSize) {
+      otaFail("size", (int)otaGot);
       return;
     }
+    if (otaBuf[0] != 0xE9) {
+      otaFail("image", otaBuf[0]);
+      return;
+    }
+    otaWriting = true;
+    navDirty = true;
+    vTaskDelay(pdMS_TO_TICKS(300));
+    if (Update.isRunning()) Update.abort();
+    if (!Update.begin(otaSize, U_FLASH)) {
+      otaFail("begin", Update.getError());
+      return;
+    }
+    for (uint32_t off = 0; off < otaSize; off += 4096) {
+      size_t len = min<uint32_t>(4096, otaSize - off);
+      if (Update.write(otaBuf + off, len) != len) {
+        Update.abort();
+        otaFail("write", Update.getError());
+        return;
+      }
+      vTaskDelay(1);
+    }
+    if (!Update.end(true)) {
+      otaFail("end", Update.getError());
+      return;
+    }
+    heap_caps_free(otaBuf);
+    otaBuf = nullptr;
     setInfo("ota=ok", true);
-    vTaskDelay(pdMS_TO_TICKS(1200));
+    vTaskDelay(pdMS_TO_TICKS(1500));
     ESP.restart();
   }
 }
@@ -1117,7 +1145,7 @@ class RxCallbacks : public BLECharacteristicCallbacks {
     if (n > sizeof(it.data)) n = sizeof(it.data);
     it.len = n;
     memcpy(it.data, c->getData(), n);
-    xQueueSend(rxQueue, &it, pdMS_TO_TICKS(it.data[0] >= 0x20 && it.data[0] <= 0x22 ? 1500 : 200));
+    xQueueSend(rxQueue, &it, pdMS_TO_TICKS(500));
   }
 };
 
@@ -1515,7 +1543,7 @@ void drawMusicScreen() {
 
 void drawOtaScreen() {
   gfx->fillScreen(C_BG);
-  textCentered("Atualizando a placa", 170, u8g2_font_helvB24_tf, C_FG);
+  textCentered(otaWriting ? "Gravando..." : "Recebendo atualização", 170, u8g2_font_helvB24_tf, C_FG);
   char b[16];
   snprintf(b, sizeof(b), "%d%%", (int)otaProgress);
   textCentered(b, 260, u8g2_font_logisoso42_tr, C_ACCENT);
