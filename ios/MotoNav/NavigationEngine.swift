@@ -14,6 +14,8 @@ struct NavSnapshot: Equatable {
     var instruction: String = ""
     var street: String = ""
     var rerouting = false
+    var curveDistance: Double?
+    var curveAngle: Double = 0
 }
 
 @MainActor
@@ -30,6 +32,10 @@ final class NavigationEngine: ObservableObject {
     @Published private(set) var mapStatus: String?
     @Published var avoidTolls = false
     @Published var avoidHighways = false
+    @Published var voiceEnabled: Bool = VoiceGuide().enabled {
+        didSet { voice.enabled = voiceEnabled }
+    }
+    private let voice = VoiceGuide()
 
     private var geometry: RouteGeometry?
     private weak var location: LocationProvider?
@@ -200,6 +206,8 @@ final class NavigationEngine: ObservableObject {
     func start(simulate: Bool) {
         guard geometry != nil else { return }
         mode = .navigating
+        voice.reset()
+        voice.say("Iniciando navegação")
         startSession()
         location?.setBackground(true)
         UIApplication.shared.isIdleTimerDisabled = true
@@ -285,6 +293,7 @@ final class NavigationEngine: ObservableObject {
             s.street = destination?.name ?? "Destino"
         } else if let k = g.nextStepIndex(after: along) {
             let m = g.maneuver(forStep: k)
+            announce(step: k, code: m.code, distance: max(0, g.stepStart[k] - along), instruction: g.instructions[k])
             s.maneuver = m.code
             s.exitNumber = m.exitNumber
             s.angle = m.angle
@@ -297,10 +306,49 @@ final class NavigationEngine: ObservableObject {
             s.distanceToManeuver = s.remainingDistance
             s.street = destination?.name ?? "Destino"
         }
+        if s.remainingDistance < 25 {
+            voice.say("Você chegou ao destino", once: "arrive-\(geometryVersion)")
+        }
+        if proj.offRoute < 45, let c = g.nextCurve(after: along, within: 300) {
+            let dist = max(0, c.curve.along - along)
+            s.curveDistance = dist
+            s.curveAngle = c.curve.angle
+            if dist <= 200 {
+                let side = c.curve.angle > 0 ? "à direita" : "à esquerda"
+                let sharp = abs(c.curve.angle) >= 90 ? "Curva acentuada" : "Curva"
+                voice.say("\(sharp) \(side)", once: "curve-\(geometryVersion)-\(c.index)")
+            }
+        }
         snapshot = s
         pushToDevice()
         sendPosition(loc, projection: proj, geometry: g)
+        sendAlert()
         updateTiles(loc)
+    }
+
+    private func announce(step k: Int, code: ManeuverCode, distance: Double, instruction: String) {
+        guard code != .arrive, code != .depart, !instruction.isEmpty else { return }
+        let text = instruction.prefix(1).lowercased() + instruction.dropFirst()
+        if distance <= 300 && distance > 120 {
+            voice.say("Em \(VoiceGuide.spokenDistance(distance)), \(text)", once: "far-\(geometryVersion)-\(k)")
+        } else if distance <= 60 {
+            voice.say(instruction, once: "near-\(geometryVersion)-\(k)")
+        }
+    }
+
+    private func sendAlert() {
+        guard let ble = ble else { return }
+        var d = Data([0x03])
+        if let dist = snapshot.curveDistance {
+            d.append(1)
+            appendLE(&d, Int16(clamping: Int(snapshot.curveAngle.rounded())))
+            appendLE(&d, UInt16(clamping: Int(dist.rounded())))
+        } else {
+            d.append(0)
+            appendLE(&d, Int16(0))
+            appendLE(&d, UInt16(0))
+        }
+        ble.sendPosition(d)
     }
 
     private func reroute(from loc: CLLocation) {
@@ -308,6 +356,7 @@ final class NavigationEngine: ObservableObject {
         lastReroute = Date()
         offRouteCount = 0
         snapshot.rerouting = true
+        voice.say("Recalculando rota")
         pushToDevice()
         Task {
             do {

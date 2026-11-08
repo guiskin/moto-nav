@@ -5,6 +5,7 @@ struct ContentView: View {
     @EnvironmentObject var ble: BLEManager
     @EnvironmentObject var location: LocationProvider
     @EnvironmentObject var engine: NavigationEngine
+    @EnvironmentObject var places: PlacesStore
     @StateObject private var search = SearchModel()
     @State private var camera: MapCameraPosition = .userLocation(fallback: .automatic)
     @FocusState private var searchFocused: Bool
@@ -85,6 +86,11 @@ struct ContentView: View {
             }
             .padding(12)
 
+            if searchFocused && search.query.isEmpty && (!places.favorites.isEmpty || !places.recents.isEmpty) {
+                Divider()
+                savedList
+            }
+
             if searchFocused && !search.results.isEmpty {
                 Divider()
                 ScrollView {
@@ -124,13 +130,24 @@ struct ContentView: View {
 
     private var previewPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(engine.destination?.name ?? "Destino").font(.title3.bold())
+            HStack {
+                Text(engine.destination?.name ?? "Destino").font(.title3.bold())
+                Spacer()
+                Button {
+                    places.toggleFavorite(engine.destination)
+                } label: {
+                    Image(systemName: places.isFavorite(engine.destination) ? "star.fill" : "star")
+                        .font(.title2)
+                        .foregroundStyle(.yellow)
+                }
+            }
             if let r = engine.route {
                 Text("\(Format.distance(r.distance)) · \(Format.duration(r.expectedTravelTime))")
                     .foregroundStyle(.secondary)
             }
             Toggle("Evitar pedágios", isOn: $engine.avoidTolls)
             Toggle("Evitar rodovias", isOn: $engine.avoidHighways)
+            Toggle("Avisos por voz", isOn: $engine.voiceEnabled)
             HStack {
                 Button("Cancelar") { engine.cancelPreview() }
                     .buttonStyle(.bordered)
@@ -161,6 +178,12 @@ struct ContentView: View {
                 Text(s.street).font(.headline).lineLimit(2)
                 if s.maneuver == .roundabout && s.exitNumber > 0 {
                     Text("\(s.exitNumber)ª saída").font(.subheadline).foregroundStyle(.secondary)
+                }
+                if let cd = s.curveDistance {
+                    Label("\(abs(s.curveAngle) >= 90 ? "Curva acentuada" : "Curva") \(s.curveAngle > 0 ? "à direita" : "à esquerda") em \(Format.distance(cd))",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.yellow)
                 }
             }
             Spacer()
@@ -194,8 +217,71 @@ struct ContentView: View {
         Task {
             if let mapItem = await search.resolve(item) {
                 search.clear()
-                await engine.planRoute(to: mapItem)
+                go(to: mapItem)
             }
+        }
+    }
+
+    private func go(to item: MKMapItem) {
+        searchFocused = false
+        places.addRecent(item)
+        Task { await engine.planRoute(to: item) }
+    }
+
+    private var savedList: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                if !places.favorites.isEmpty {
+                    sectionHeader("Favoritos")
+                    ForEach(places.favorites) { p in
+                        savedRow(p, icon: "star.fill", tint: .yellow) { places.removeFavorite(p) }
+                    }
+                }
+                if !places.recents.isEmpty {
+                    HStack {
+                        sectionHeader("Recentes")
+                        Spacer()
+                        Button("Limpar") { places.clearRecents() }
+                            .font(.caption)
+                            .padding(.trailing, 12)
+                    }
+                    ForEach(places.recents) { p in
+                        savedRow(p, icon: "clock", tint: .secondary) { places.removeRecent(p) }
+                    }
+                }
+            }
+        }
+        .frame(maxHeight: 360)
+    }
+
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
+    }
+
+    private func savedRow(_ p: SavedPlace, icon: String, tint: Color, remove: @escaping () -> Void) -> some View {
+        Button {
+            go(to: p.mapItem)
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: icon).foregroundStyle(tint).frame(width: 20)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(p.name).foregroundStyle(.primary).lineLimit(1)
+                    if !p.subtitle.isEmpty {
+                        Text(p.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+        }
+        .contextMenu {
+            Button("Remover", role: .destructive, action: remove)
         }
     }
 }

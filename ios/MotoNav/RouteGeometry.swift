@@ -77,6 +77,12 @@ struct RouteGeometry {
     private(set) var cum: [Double] = []
     private(set) var stepStart: [Double] = []
     private(set) var instructions: [String] = []
+    private(set) var curves: [Curve] = []
+
+    struct Curve {
+        let along: Double
+        let angle: Double
+    }
 
     var total: Double { cum.last ?? 0 }
 
@@ -93,6 +99,52 @@ struct RouteGeometry {
             cum = []
             for p in route.polyline.coordinateArray { append(p) }
         }
+        curves = findCurves()
+    }
+
+    private func findCurves() -> [Curve] {
+        guard total > 120 else { return [] }
+        let step = 10.0
+        let w = 8
+        let n = Int(total / step)
+        var bearings: [Double] = []
+        bearings.reserveCapacity(n)
+        for i in 0..<n {
+            let d = Double(i) * step
+            bearings.append(Geo.bearing(point(at: d), point(at: d + step)))
+        }
+        guard bearings.count > w + 1 else { return [] }
+        let maneuvers = Array(stepStart.dropFirst())
+        var result: [Curve] = []
+        var i = 0
+        while i < bearings.count - w {
+            let d = Geo.normalize(bearings[i + w] - bearings[i])
+            guard abs(d) >= 45 else {
+                i += 1
+                continue
+            }
+            var best = d
+            var j = i
+            while j < bearings.count - w {
+                let dj = Geo.normalize(bearings[j + w] - bearings[j])
+                if abs(dj) < 45 || (dj > 0) != (best > 0) { break }
+                if abs(dj) > abs(best) { best = dj }
+                j += 1
+            }
+            let center = Double(i) * step + Double(w) * step / 2
+            if !maneuvers.contains(where: { abs($0 - center) < 60 }) {
+                result.append(Curve(along: Double(i) * step + 20, angle: best))
+            }
+            i = j + w / 2
+        }
+        return result
+    }
+
+    func nextCurve(after along: Double, within range: Double) -> (index: Int, curve: Curve)? {
+        for (i, c) in curves.enumerated() where c.along > along - 10 {
+            return c.along - along <= range ? (i, c) : nil
+        }
+        return nil
     }
 
     private mutating func append(_ p: CLLocationCoordinate2D) {

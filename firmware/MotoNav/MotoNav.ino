@@ -102,6 +102,13 @@ struct PosTarget {
   uint32_t ms;
 };
 
+struct AlertData {
+  uint8_t type;
+  int16_t angle;
+  uint16_t dist;
+  uint32_t ms;
+};
+
 struct Chunk {
   int32_t minX, minY, maxX, maxY;
   uint32_t start;
@@ -164,6 +171,7 @@ bool touchOk = false;
 portMUX_TYPE navMux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE gpsMux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE posMux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE alertMux = portMUX_INITIALIZER_UNLOCKED;
 SemaphoreHandle_t i2cMutex;
 SemaphoreHandle_t mapMutex;
 QueueHandle_t rxQueue;
@@ -171,6 +179,9 @@ QueueHandle_t rxQueue;
 NavData navShared = {};
 GpsData gpsShared = {};
 PosTarget posShared = {};
+AlertData alertShared = {};
+bool approaching = false;
+uint32_t approachStart = 0;
 World world = {};
 volatile uint32_t lastNavMs = 0;
 volatile bool navDirty = true;
@@ -494,6 +505,18 @@ void handlePosPacket(const uint8_t *p, size_t n) {
   portEXIT_CRITICAL(&posMux);
 }
 
+void handleAlertPacket(const uint8_t *p, size_t n) {
+  if (n < 6) return;
+  AlertData a;
+  a.type = p[1];
+  a.angle = (int16_t)rd16(p + 2);
+  a.dist = rd16(p + 4);
+  a.ms = millis();
+  portENTER_CRITICAL(&alertMux);
+  alertShared = a;
+  portEXIT_CRITICAL(&alertMux);
+}
+
 void handleMapPacket(const uint8_t *p, size_t n) {
   if (p[0] == 0x10 && n >= 7) {
     uint16_t id = rd16(p + 1);
@@ -533,6 +556,7 @@ void rxTask(void *) {
     switch (it.data[0]) {
       case 0x01: handleNavPacket(it.data, it.len); break;
       case 0x02: handlePosPacket(it.data, it.len); break;
+      case 0x03: handleAlertPacket(it.data, it.len); break;
       case 0x10:
       case 0x11:
       case 0x12: handleMapPacket(it.data, it.len); break;
@@ -779,6 +803,52 @@ void formatMinutes(uint16_t min, char *out, size_t sz) {
   else snprintf(out, sz, "%uh%02u", min / 60, min % 60);
 }
 
+bool isTurn(uint8_t m) {
+  return m != M_NONE && m != M_STRAIGHT && m != M_DEPART;
+}
+
+bool blinkOn() {
+  uint32_t now = millis();
+  if (now - approachStart > 3000) return true;
+  return ((now - approachStart) / 300) % 2 == 0;
+}
+
+void drawAlertRing() {
+  if (!approaching || !blinkOn()) return;
+  for (int r = 226; r <= 232; r++) gfx->drawCircle(CX, LCD_H / 2, r, C_ORANGE);
+}
+
+void drawCurveBadge(int x, int y, int16_t angle, uint16_t dist) {
+  gfx->fillCircle(x, y, 36, 0xFFE0);
+  float dir = angle >= 0 ? 1.0f : -1.0f;
+  bool sharp = abs(angle) >= 90;
+  float px = x, py = y + 20;
+  float ex = x + dir * (sharp ? 16 : 14), ey = sharp ? y - 2 : y - 16;
+  float cx = x, cy = y - 16;
+  for (int i = 1; i <= 12; i++) {
+    float t = i / 12.0f;
+    float bx = (1 - t) * (1 - t) * x + 2 * (1 - t) * t * cx + t * t * ex;
+    float by = (1 - t) * (1 - t) * (y + 20) + 2 * (1 - t) * t * cy + t * t * ey;
+    thickLine(px, py, bx, by, 4, RGB565_BLACK);
+    px = bx;
+    py = by;
+  }
+  float ang = atan2f(ex - cx, -(ey - cy));
+  arrowHead(ex, ey, ang, 12, RGB565_BLACK);
+  char b[16];
+  snprintf(b, sizeof(b), "%u m", (unsigned)((dist / 10) * 10));
+  gfx->setFont(u8g2_font_helvB18_tf);
+  int w = textWidth(b);
+  textAt(b, x - w / 2, y + 60, u8g2_font_helvB18_tf, 0xFFE0);
+}
+
+bool curveActive(AlertData &a) {
+  portENTER_CRITICAL(&alertMux);
+  a = alertShared;
+  portEXIT_CRITICAL(&alertMux);
+  return a.type == 1 && millis() - a.ms < 5000 && a.dist <= 300;
+}
+
 void drawNavScreen(const NavData &n) {
   gfx->fillScreen(C_BG);
   char b[48];
@@ -788,9 +858,11 @@ void drawNavScreen(const NavData &n) {
     textCentered("Chegou", 120, u8g2_font_logisoso42_tr, C_GREEN);
   } else {
     formatDistance(n.distM, b, sizeof(b));
-    textCentered(b, 120, u8g2_font_logisoso42_tr, C_FG);
+    textCentered(b, 120, u8g2_font_logisoso42_tr, approaching ? C_ORANGE : C_FG);
   }
   drawManeuver(n, CX, 220, 1.0f, C_BG);
+  AlertData a;
+  if (curveActive(a)) drawCurveBadge(CX + 150, 220, a.angle, a.dist);
   if (n.flags & 0x01) {
     textCentered("Recalculando...", 372, u8g2_font_helvB24_tf, C_ORANGE);
   } else {
@@ -895,11 +967,13 @@ void drawPositionMarker() {
 }
 
 void drawMapOverlay(const NavData &n, float speedKmh) {
-  gfx->fillRect(0, 0, LCD_W, 150, C_PANEL);
+  uint16_t panelBg = C_PANEL;
+  if (approaching) panelBg = blinkOn() ? 0xC300 : C_PANEL;
+  gfx->fillRect(0, 0, LCD_W, 150, panelBg);
   gfx->drawFastHLine(0, 150, LCD_W, 0x2104);
   char b[48];
   NavData mini = n;
-  drawManeuver(mini, CX - 115, 92, 0.42f, C_PANEL);
+  drawManeuver(mini, CX - 115, 92, 0.42f, panelBg);
   if (n.maneuver == M_ARRIVE && n.distM < 30) {
     textAt("Chegou", CX - 65, 108, u8g2_font_logisoso42_tr, C_GREEN);
   } else {
@@ -1042,6 +1116,8 @@ void drawMapScreen(const NavData &n, const PosTarget &t, uint32_t now) {
   xSemaphoreGive(mapMutex);
   drawPositionMarker();
   drawMapOverlay(n, t.speed * 3.6f);
+  AlertData a;
+  if (curveActive(a)) drawCurveBadge(75, 290, a.angle, a.dist);
 }
 
 void drawWaitingMap(const NavData &n, const char *msg) {
@@ -1114,6 +1190,15 @@ void loop() {
   n = navShared;
   portEXIT_CRITICAL(&navMux);
   bool navOn = n.active && bleConnected && (now - lastNavMs < NAV_TIMEOUT_MS);
+  if (navOn && isTurn(n.maneuver) && n.distM <= 150 && !(n.flags & 0x01)) {
+    if (!approaching) {
+      approaching = true;
+      approachStart = now;
+      navDirty = true;
+    }
+  } else if (!navOn || n.distM > 180 || !isTurn(n.maneuver)) {
+    approaching = false;
+  }
 
   if (checkToggle(now) && navOn) {
     showMap = !showMap;
@@ -1127,7 +1212,7 @@ void loop() {
   bool mapReady = world.hasSession && t.valid && t.mapId == world.session && (now - t.ms) < 10000;
   bool animating = navOn && showMap && mapReady;
 
-  uint32_t interval = animating ? 40 : (navOn ? 250 : 1000);
+  uint32_t interval = animating ? 40 : (approaching ? 100 : (navOn ? 250 : 1000));
   if (!navDirty && now - lastDraw < interval) {
     delay(5);
     return;
@@ -1153,5 +1238,6 @@ void loop() {
     else snprintf(msg, sizeof(msg), "Aguardando mapa...");
     drawWaitingMap(n, msg);
   }
+  if (navOn) drawAlertRing();
   gfx->flush();
 }
