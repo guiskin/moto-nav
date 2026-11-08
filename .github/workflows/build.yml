@@ -65,8 +65,10 @@ jobs:
         run: |
           arduino-cli compile \
             --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,CDCOnBoot=cdc" \
+            --build-property "compiler.cpp.extra_flags=-DFW_VERSION=${{ github.run_number }}" \
             --library waveshare/examples/arduino/libraries/GFX_Library_for_Arduino \
             --library waveshare/examples/arduino/libraries/SensorLib \
+            --library waveshare/examples/arduino/libraries/XPowersLib \
             --output-dir out firmware/MotoNav
       - uses: actions/upload-artifact@v4
         with:
@@ -78,5 +80,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp out/MotoNav.ino.merged.bin MotoNav-firmware.bin
+          cp out/MotoNav.ino.bin MotoNav-app.bin
+          echo "${{ github.run_number }}" > version.txt
           gh release view firmware >/dev/null 2>&1 || gh release create firmware --title "Firmware da placa" --notes "Gravar no endereço 0x0"
-          gh release upload firmware MotoNav-firmware.bin --clobber
+          gh release upload firmware MotoNav-firmware.bin MotoNav-app.bin version.txt --clobber

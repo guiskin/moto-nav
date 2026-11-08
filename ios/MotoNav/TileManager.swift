@@ -6,6 +6,23 @@ struct TileKey: Hashable {
     let y: Int16
 }
 
+struct RoadInfo {
+    let maxspeed: Int?
+    let name: String?
+    let pts: [(Double, Double)]
+}
+
+struct CameraInfo {
+    let x: Double
+    let y: Double
+    let maxspeed: Int?
+}
+
+struct TileFeatures {
+    var roads: [RoadInfo] = []
+    var cameras: [CameraInfo] = []
+}
+
 @MainActor
 final class TileManager {
     nonisolated static let size = 800.0
@@ -16,6 +33,7 @@ final class TileManager {
     var onStatus: ((String?) -> Void)?
 
     private var blobs: [TileKey: Data] = [:]
+    private var features: [TileKey: TileFeatures] = [:]
     private var sent: Set<TileKey> = []
     private var inFlight: Set<TileKey> = []
     private var failedAt: [TileKey: Date] = [:]
@@ -27,8 +45,8 @@ final class TileManager {
         self.projection = projection
     }
 
-    func key(x: Double, y: Double) -> TileKey {
-        TileKey(x: Int16(clamping: Int(floor(x / Self.size))), y: Int16(clamping: Int(floor(y / Self.size))))
+    nonisolated static func key(x: Double, y: Double) -> TileKey {
+        TileKey(x: Int16(clamping: Int(floor(x / size))), y: Int16(clamping: Int(floor(y / size))))
     }
 
     func resetSent() {
@@ -36,7 +54,7 @@ final class TileManager {
     }
 
     func update(position: (x: Double, y: Double), ahead: [(x: Double, y: Double)]) {
-        let center = key(x: position.x, y: position.y)
+        let center = Self.key(x: position.x, y: position.y)
         var desired: [TileKey] = []
         var seen = Set<TileKey>()
         func add(_ k: TileKey) {
@@ -48,7 +66,7 @@ final class TileManager {
                 add(TileKey(x: center.x &+ Int16(dx), y: center.y &+ Int16(dy)))
             }
         }
-        for p in ahead { add(key(x: p.x, y: p.y)) }
+        for p in ahead { add(Self.key(x: p.x, y: p.y)) }
         desired.sort { distance($0, position) < distance($1, position) }
         lastDesired = desired
         pump(position: position)
@@ -57,6 +75,67 @@ final class TileManager {
     private func distance(_ k: TileKey, _ p: (x: Double, y: Double)) -> Double {
         let cx = (Double(k.x) + 0.5) * Self.size, cy = (Double(k.y) + 0.5) * Self.size
         return hypot(cx - p.x, cy - p.y)
+    }
+
+    private func nearbyFeatures(_ p: (x: Double, y: Double)) -> [TileFeatures] {
+        let c = Self.key(x: p.x, y: p.y)
+        var out: [TileFeatures] = []
+        for dy in -1...1 {
+            for dx in -1...1 {
+                if let f = features[TileKey(x: c.x &+ Int16(dx), y: c.y &+ Int16(dy))] { out.append(f) }
+            }
+        }
+        return out
+    }
+
+    private static func angleDiff(_ a: Double, _ b: Double) -> Double {
+        var d = (a - b).truncatingRemainder(dividingBy: 360)
+        if d > 180 { d -= 360 }
+        if d < -180 { d += 360 }
+        return abs(d)
+    }
+
+    func roadInfo(at p: (x: Double, y: Double), course: Double?) -> (limit: Int?, name: String?) {
+        var best: (score: Double, road: RoadInfo)?
+        for f in nearbyFeatures(p) {
+            for road in f.roads {
+                for i in 0..<(road.pts.count - 1) {
+                    let a = road.pts[i], b = road.pts[i + 1]
+                    let dx = b.0 - a.0, dy = b.1 - a.1
+                    let len2 = dx * dx + dy * dy
+                    var t = len2 > 0 ? ((p.x - a.0) * dx + (p.y - a.1) * dy) / len2 : 0
+                    t = min(max(t, 0), 1)
+                    let d = hypot(a.0 + dx * t - p.x, a.1 + dy * t - p.y)
+                    guard d < 20 else { continue }
+                    var score = d
+                    if let c = course, len2 > 1 {
+                        let segB = atan2(dx, dy) * 180 / .pi
+                        let diff = min(Self.angleDiff(segB, c), Self.angleDiff(segB + 180, c))
+                        score += diff * 0.4
+                    }
+                    if best == nil || score < best!.score { best = (score, road) }
+                }
+            }
+        }
+        return (best?.road.maxspeed, best?.road.name)
+    }
+
+    func nextCamera(at p: (x: Double, y: Double), course: Double?) -> (key: String, distance: Double, limit: Int?)? {
+        var best: (key: String, distance: Double, limit: Int?)?
+        for f in nearbyFeatures(p) {
+            for cam in f.cameras {
+                let d = hypot(cam.x - p.x, cam.y - p.y)
+                guard d <= 600 else { continue }
+                if let c = course {
+                    let b = atan2(cam.x - p.x, cam.y - p.y) * 180 / .pi
+                    guard d < 25 || Self.angleDiff(b, c) < 30 else { continue }
+                }
+                if best == nil || d < best!.distance {
+                    best = (String(format: "%.0f,%.0f", cam.x, cam.y), d, cam.maxspeed)
+                }
+            }
+        }
+        return best
     }
 
     private func pump(position: (x: Double, y: Double)) {
@@ -91,12 +170,13 @@ final class TileManager {
         let proj = projection
         let session = self.session
         do {
-            let ways = try await OverpassClient.fetchWays(in: boxes)
+            let result = try await OverpassClient.fetchWays(in: boxes)
             let built = await Task.detached(priority: .userInitiated) {
-                Self.split(ways: ways, keys: batch, projection: proj, session: session)
+                Self.split(result: result, keys: batch, projection: proj, session: session)
             }.value
             for k in batch {
-                blobs[k] = built[k] ?? MapBuilder.tileBlob(session: session, tx: k.x, ty: k.y, lines: [])
+                blobs[k] = built.blobs[k] ?? MapBuilder.tileBlob(session: session, tx: k.x, ty: k.y, lines: [])
+                features[k] = built.features[k] ?? TileFeatures()
                 failedAt[k] = nil
             }
             onStatus?(nil)
@@ -110,13 +190,12 @@ final class TileManager {
         pump(position: position)
     }
 
-    nonisolated private static func split(ways: [OverpassClient.Way], keys: [TileKey], projection: LocalProjection, session: UInt16) -> [TileKey: Data] {
+    nonisolated private static func split(result: OverpassClient.Result, keys: [TileKey], projection: LocalProjection,
+                                          session: UInt16) -> (blobs: [TileKey: Data], features: [TileKey: TileFeatures]) {
         let wanted = Set(keys)
         var runs: [TileKey: [(kind: UInt8, pts: [(Double, Double)])]] = [:]
-        func tileOf(_ p: (Double, Double)) -> TileKey {
-            TileKey(x: Int16(clamping: Int(floor(p.0 / size))), y: Int16(clamping: Int(floor(p.1 / size))))
-        }
-        for way in ways {
+        var feats: [TileKey: TileFeatures] = [:]
+        for way in result.ways {
             var pts: [(Double, Double)] = []
             for c in way.points {
                 let p = projection.project(c)
@@ -133,13 +212,15 @@ final class TileManager {
                 }
                 pts.append(q)
             }
+            var touched = Set<TileKey>()
             var open: [TileKey: Int] = [:]
             for i in 0..<(pts.count - 1) {
                 let a = pts[i], b = pts[i + 1]
-                var tiles = [tileOf(a)]
-                let tb = tileOf(b)
+                var tiles = [key(x: a.0, y: a.1)]
+                let tb = key(x: b.0, y: b.1)
                 if tb != tiles[0] { tiles.append(tb) }
                 for t in tiles where wanted.contains(t) {
+                    touched.insert(t)
                     if let idx = open[t], let lastPt = runs[t]?[idx].pts.last, lastPt == a {
                         runs[t]![idx].pts.append(b)
                     } else {
@@ -148,6 +229,16 @@ final class TileManager {
                     }
                 }
             }
+            if way.maxspeed != nil || way.name != nil {
+                let info = RoadInfo(maxspeed: way.maxspeed, name: way.name, pts: MapBuilder.simplify(pts, tolerance: 2.0))
+                for t in touched { feats[t, default: TileFeatures()].roads.append(info) }
+            }
+        }
+        for cam in result.cameras {
+            let p = projection.project(cam.coordinate)
+            let k = key(x: p.x, y: p.y)
+            guard wanted.contains(k) else { continue }
+            feats[k, default: TileFeatures()].cameras.append(CameraInfo(x: p.x, y: p.y, maxspeed: cam.maxspeed))
         }
         var out: [TileKey: Data] = [:]
         for (t, list) in runs {
@@ -158,6 +249,6 @@ final class TileManager {
             }
             out[t] = MapBuilder.tileBlob(session: session, tx: t.x, ty: t.y, lines: lines)
         }
-        return out
+        return (out, feats)
     }
 }

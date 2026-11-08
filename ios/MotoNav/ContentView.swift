@@ -6,6 +6,10 @@ struct ContentView: View {
     @EnvironmentObject var location: LocationProvider
     @EnvironmentObject var engine: NavigationEngine
     @EnvironmentObject var places: PlacesStore
+    @EnvironmentObject var settings: SettingsStore
+    @EnvironmentObject var trips: TripStore
+    @State private var showSettings = false
+    @State private var showTrips = false
     @StateObject private var search = SearchModel()
     @State private var camera: MapCameraPosition = .userLocation(fallback: .automatic)
     @FocusState private var searchFocused: Bool
@@ -28,17 +32,34 @@ struct ContentView: View {
             .ignoresSafeArea()
 
             VStack(spacing: 10) {
-                statusPill
+                HStack(spacing: 8) {
+                    statusPill
+                    Spacer()
+                    if !engine.isActive {
+                        circleButton("list.bullet") { showTrips = true }
+                    }
+                    circleButton("gearshape.fill") { showSettings = true }
+                }
                 switch engine.mode {
                 case .idle: searchPanel
                 case .preview: EmptyView()
                 case .navigating: navPanel
+                case .cruising: cruisePanel
                 }
                 Spacer()
                 if engine.mode == .preview { previewPanel }
-                if engine.mode == .navigating { bottomBar }
+                if engine.isActive { bottomBar }
             }
             .padding()
+        }
+        .sheet(isPresented: $showSettings) {
+            SettingsView()
+                .environmentObject(settings)
+                .environmentObject(ble)
+                .environmentObject(engine)
+        }
+        .sheet(isPresented: $showTrips) {
+            TripsView().environmentObject(trips)
         }
         .onChange(of: location.location) { _, loc in
             if let c = loc?.coordinate { search.setRegion(around: c) }
@@ -51,7 +72,7 @@ struct ContentView: View {
             }
         }
         .onChange(of: engine.mode) { _, m in
-            if m == .navigating {
+            if m == .navigating || m == .cruising {
                 withAnimation { camera = .userLocation(followsHeading: true, fallback: .automatic) }
             }
         }
@@ -85,6 +106,17 @@ struct ContentView: View {
                 }
             }
             .padding(12)
+
+            if !searchFocused && search.query.isEmpty {
+                Divider()
+                Button {
+                    engine.startCruise()
+                } label: {
+                    Label("Passeio sem rota", systemImage: "road.lanes")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                }
+            }
 
             if searchFocused && search.query.isEmpty && (!places.favorites.isEmpty || !places.recents.isEmpty) {
                 Divider()
@@ -179,6 +211,7 @@ struct ContentView: View {
                 if s.maneuver == .roundabout && s.exitNumber > 0 {
                     Text("\(s.exitNumber)ª saída").font(.subheadline).foregroundStyle(.secondary)
                 }
+                limitRadarLine(s)
                 if let cd = s.curveDistance {
                     Label("\(abs(s.curveAngle) >= 90 ? "Curva acentuada" : "Curva") \(s.curveAngle > 0 ? "à direita" : "à esquerda") em \(Format.distance(cd))",
                           systemImage: "exclamationmark.triangle.fill")
@@ -192,11 +225,54 @@ struct ContentView: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 
+    private func circleButton(_ icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.headline)
+                .frame(width: 40, height: 40)
+                .background(.regularMaterial, in: Circle())
+        }
+        .foregroundStyle(.primary)
+    }
+
+    @ViewBuilder
+    private func limitRadarLine(_ s: NavSnapshot) -> some View {
+        if s.limit != nil || s.radarDistance != nil {
+            HStack(spacing: 12) {
+                if let l = s.limit {
+                    Text("Limite \(l)")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(s.speedKmh > Double(l) + 3 ? .red : .primary)
+                }
+                if let r = s.radarDistance {
+                    Label("Radar \(Format.distance(r))", systemImage: "camera.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.orange)
+                }
+            }
+        }
+    }
+
+    private var cruisePanel: some View {
+        let s = engine.snapshot
+        return VStack(alignment: .leading, spacing: 6) {
+            Text(s.roadName ?? "Passeio").font(.title3.bold()).lineLimit(1)
+            limitRadarLine(s)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding()
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
+
     private var bottomBar: some View {
         let s = engine.snapshot
         return HStack {
             VStack(alignment: .leading) {
-                Text("\(Format.distance(s.remainingDistance)) · \(Format.duration(s.remainingTime))").font(.headline)
+                if engine.mode == .cruising {
+                    Text("Passeio · \(Format.distance(s.tripDistance))").font(.headline)
+                } else {
+                    Text("\(Format.distance(s.remainingDistance)) · \(Format.duration(s.remainingTime))").font(.headline)
+                }
                 Text("\(Int(s.speedKmh.rounded())) km/h").foregroundStyle(.secondary)
                 if let p = ble.uploadProgress {
                     Text("Enviando mapa \(Int(p * 100))%").font(.caption).foregroundStyle(.orange)
@@ -205,6 +281,14 @@ struct ContentView: View {
                 }
             }
             Spacer()
+            if let text = engine.etaShareText() {
+                ShareLink(item: text) {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.headline)
+                        .frame(width: 40, height: 40)
+                }
+                .buttonStyle(.bordered)
+            }
             Button("Encerrar", role: .destructive) { engine.stop() }
                 .buttonStyle(.borderedProminent)
         }

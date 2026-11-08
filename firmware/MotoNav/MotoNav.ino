@@ -10,6 +10,16 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <esp_heap_caps.h>
+#include <Update.h>
+#define XPOWERS_CHIP_AXP2101
+#include "XPowersLib.h"
+#include <host/ble_hs.h>
+#include <host/ble_gap.h>
+#include <host/ble_gatt.h>
+
+#ifndef FW_VERSION
+#define FW_VERSION 0
+#endif
 
 #define LCD_SDIO0 4
 #define LCD_SDIO1 5
@@ -35,6 +45,9 @@
 #define SERVICE_UUID "6e0a0001-7a3b-4c2d-9e1f-0b5a4d3c2b1a"
 #define NAV_CHAR_UUID "6e0a0002-7a3b-4c2d-9e1f-0b5a4d3c2b1a"
 #define MAP_CHAR_UUID "6e0a0003-7a3b-4c2d-9e1f-0b5a4d3c2b1a"
+#define INFO_CHAR_UUID "6e0a0004-7a3b-4c2d-9e1f-0b5a4d3c2b1a"
+#define OTA_CHAR_UUID "6e0a0005-7a3b-4c2d-9e1f-0b5a4d3c2b1a"
+#define SLEEP_AFTER_MS 600000
 
 #define CX (LCD_W / 2)
 #define NAV_TIMEOUT_MS 20000
@@ -47,9 +60,11 @@
 #define C_ACCENT 0x07FF
 #define C_GREEN 0x47E8
 #define C_ORANGE 0xFD20
-#define C_MAP_BG 0x0841
+#define C_MAP_BG (nightMode ? 0x0000 : 0x0841)
+#define C_RED 0xF800
+#define C_YELLOW 0xFFE0
 #define C_PANEL 0x0000
-#define C_ROUTE 0x2D7F
+#define C_ROUTE (nightMode ? 0x1A54 : 0x2D7F)
 #define C_ROUTE_EDGE 0x0010
 
 enum Maneuver : uint8_t {
@@ -109,6 +124,30 @@ struct AlertData {
   uint32_t ms;
 };
 
+struct StatusData {
+  uint8_t limit;
+  uint16_t radarDist;
+  uint32_t ms;
+  char street[64];
+};
+
+struct Toast {
+  bool active;
+  bool call;
+  uint32_t uid;
+  uint32_t until;
+  char app[24];
+  char title[64];
+  char msg[128];
+};
+
+struct Music {
+  bool available;
+  bool playing;
+  char title[64];
+  char artist[64];
+};
+
 struct Chunk {
   int32_t minX, minY, maxX, maxY;
   uint32_t start;
@@ -156,6 +195,22 @@ struct View {
   float mpp;
 };
 
+struct Tap {
+  bool tapped;
+  bool button;
+  int16_t x;
+  int16_t y;
+};
+
+struct GattCtx {
+  int status;
+  uint16_t start, end;
+  int nWant;
+  ble_uuid128_t want[4];
+  uint16_t found[4];
+  uint16_t cccd;
+};
+
 struct RxItem {
   uint16_t len;
   uint8_t data[250];
@@ -188,7 +243,42 @@ volatile bool navDirty = true;
 volatile bool bleConnected = false;
 volatile int mapProgress = -1;
 volatile bool touchPending = false;
-bool showMap = true;
+bool nightMode = false;
+
+enum : uint8_t { SCR_MAP = 0, SCR_ARROW = 1, SCR_MUSIC = 2, SCR_IDLE = 3 };
+uint8_t screenIdx = 0;
+uint8_t lastMode = 255;
+
+XPowersPMU pmu;
+bool pmuOk = false;
+volatile int batteryPct = -1;
+volatile bool charging = false;
+
+portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE toastMux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE musicMux = portMUX_INITIALIZER_UNLOCKED;
+StatusData statusShared = {};
+Toast toastShared = {};
+Music musicShared = {};
+uint8_t setBrightnessVal = 255;
+uint8_t setNight = 0;
+uint8_t setNotify = 1;
+volatile uint32_t settingsMs = 0;
+uint8_t appliedBrightness = 0;
+
+BLECharacteristic *infoChar = nullptr;
+volatile uint16_t connHandle = 0xFFFF;
+volatile bool linkEncrypted = false;
+SemaphoreHandle_t gattSem;
+SemaphoreHandle_t encSem;
+
+volatile bool otaActive = false;
+volatile int otaProgress = 0;
+uint32_t otaSize = 0;
+uint32_t otaGot = 0;
+
+uint32_t lastActivity = 0;
+bool screenOff = false;
 
 uint8_t *rxBuf = nullptr;
 uint32_t rxTotal = 0;
@@ -233,8 +323,24 @@ void readGps() {
   for (uint32_t i = 0; i < len; i++) gps.encode(data[i]);
 }
 
+void readBattery() {
+  if (!pmuOk) return;
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  bool conn = pmu.isBatteryConnect();
+  int pct = conn ? pmu.getBatteryPercent() : -1;
+  bool chg = pmu.isCharging();
+  xSemaphoreGive(i2cMutex);
+  batteryPct = pct;
+  charging = chg;
+}
+
 void gpsTask(void *) {
+  uint32_t lastBatt = 0;
   for (;;) {
+    if (millis() - lastBatt > 30000 || lastBatt == 0) {
+      readBattery();
+      lastBatt = millis() | 1;
+    }
     readGps();
     GpsData g;
     g.timeValid = gps.time.isValid();
@@ -517,6 +623,98 @@ void handleAlertPacket(const uint8_t *p, size_t n) {
   portEXIT_CRITICAL(&alertMux);
 }
 
+void handleStatusPacket(const uint8_t *p, size_t n) {
+  if (n < 5) return;
+  StatusData st = {};
+  st.limit = p[1];
+  st.radarDist = rd16(p + 2);
+  size_t tl = n - 5;
+  if (tl > sizeof(st.street) - 1) tl = sizeof(st.street) - 1;
+  memcpy(st.street, p + 5, tl);
+  st.street[tl] = 0;
+  st.ms = millis();
+  portENTER_CRITICAL(&statusMux);
+  statusShared = st;
+  portEXIT_CRITICAL(&statusMux);
+}
+
+void handleSettingsPacket(const uint8_t *p, size_t n) {
+  if (n < 4) return;
+  setBrightnessVal = max<uint8_t>(20, p[1]);
+  setNight = p[2];
+  setNotify = p[3];
+  settingsMs = millis() | 1;
+  navDirty = true;
+}
+
+void setInfo(const char *s, bool notify) {
+  if (!infoChar) return;
+  infoChar->setValue((uint8_t *)s, strlen(s));
+  if (notify && bleConnected) infoChar->notify();
+}
+
+void handleOtaPacket(const uint8_t *p, size_t n) {
+  char msg[40];
+  if (p[0] == 0x20 && n >= 5) {
+    otaSize = rd32(p + 1);
+    otaGot = 0;
+    if (Update.isRunning()) Update.abort();
+    if (otaSize == 0 || !Update.begin(otaSize, U_FLASH)) {
+      otaActive = false;
+      snprintf(msg, sizeof(msg), "ota=err:begin:%d", Update.getError());
+      setInfo(msg, true);
+      return;
+    }
+    otaActive = true;
+    otaProgress = 0;
+    navDirty = true;
+    setInfo("ota=p:0", true);
+  } else if (p[0] == 0x21 && n >= 5) {
+    if (!otaActive) return;
+    uint32_t off = rd32(p + 1);
+    if (off != otaGot) {
+      Update.abort();
+      otaActive = false;
+      snprintf(msg, sizeof(msg), "ota=err:offset:%lu:%lu", (unsigned long)off, (unsigned long)otaGot);
+      setInfo(msg, true);
+      navDirty = true;
+      return;
+    }
+    size_t dl = n - 5;
+    if (Update.write((uint8_t *)p + 5, dl) != dl) {
+      Update.abort();
+      otaActive = false;
+      snprintf(msg, sizeof(msg), "ota=err:write:%d", Update.getError());
+      setInfo(msg, true);
+      navDirty = true;
+      return;
+    }
+    otaGot += dl;
+    int pr = otaSize ? (int)((uint64_t)otaGot * 100 / otaSize) : 0;
+    if (pr != otaProgress) {
+      otaProgress = pr;
+      navDirty = true;
+      if (pr % 5 == 0) {
+        snprintf(msg, sizeof(msg), "ota=p:%d", pr);
+        setInfo(msg, true);
+      }
+    }
+  } else if (p[0] == 0x22) {
+    if (!otaActive) return;
+    bool ok = otaGot == otaSize && Update.end(true);
+    otaActive = false;
+    navDirty = true;
+    if (!ok) {
+      snprintf(msg, sizeof(msg), "ota=err:end:%d", Update.getError());
+      setInfo(msg, true);
+      return;
+    }
+    setInfo("ota=ok", true);
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    ESP.restart();
+  }
+}
+
 void handleMapPacket(const uint8_t *p, size_t n) {
   if (p[0] == 0x10 && n >= 7) {
     uint16_t id = rd16(p + 1);
@@ -548,6 +746,329 @@ void handleMapPacket(const uint8_t *p, size_t n) {
   }
 }
 
+struct IosHandles {
+  uint16_t nsVal, nsCccd;
+  uint16_t cpVal;
+  uint16_t dsVal, dsCccd;
+  uint16_t rcVal;
+  uint16_t euVal, euCccd;
+};
+IosHandles ios = {};
+uint8_t dsBuf[600];
+uint16_t dsLen = 0;
+uint32_t pendingUid = 0;
+uint8_t pendingCat = 0;
+
+bool uuidFromStr(const char *str, ble_uuid128_t &u) {
+  uint8_t bytes[16];
+  int bi = 0;
+  for (const char *c = str; *c && bi < 32; c++) {
+    if (*c == '-') continue;
+    char h[3] = { c[0], c[1], 0 };
+    if (!c[1]) return false;
+    bytes[bi / 2] = (uint8_t)strtol(h, nullptr, 16);
+    bi += 2;
+    c++;
+  }
+  if (bi != 32) return false;
+  u.u.type = BLE_UUID_TYPE_128;
+  for (int i = 0; i < 16; i++) u.value[i] = bytes[15 - i];
+  return true;
+}
+
+int svcCb(uint16_t conn, const ble_gatt_error *err, const ble_gatt_svc *svc, void *arg) {
+  GattCtx *c = (GattCtx *)arg;
+  if (err->status == 0 && svc) {
+    c->start = svc->start_handle;
+    c->end = svc->end_handle;
+  } else {
+    if (err->status != BLE_HS_EDONE) c->status = err->status;
+    xSemaphoreGive(gattSem);
+  }
+  return 0;
+}
+
+int chrCb(uint16_t conn, const ble_gatt_error *err, const ble_gatt_chr *chr, void *arg) {
+  GattCtx *c = (GattCtx *)arg;
+  if (err->status == 0 && chr) {
+    for (int i = 0; i < c->nWant; i++) {
+      if (ble_uuid_cmp(&chr->uuid.u, &c->want[i].u) == 0) c->found[i] = chr->val_handle;
+    }
+  } else {
+    if (err->status != BLE_HS_EDONE) c->status = err->status;
+    xSemaphoreGive(gattSem);
+  }
+  return 0;
+}
+
+int dscCb(uint16_t conn, const ble_gatt_error *err, uint16_t chrVal, const ble_gatt_dsc *dsc, void *arg) {
+  GattCtx *c = (GattCtx *)arg;
+  if (err->status == 0 && dsc) {
+    if (c->cccd == 0 && ble_uuid_u16(&dsc->uuid.u) == 0x2902) c->cccd = dsc->handle;
+  } else {
+    if (err->status != BLE_HS_EDONE) c->status = err->status;
+    xSemaphoreGive(gattSem);
+  }
+  return 0;
+}
+
+int writeCb(uint16_t conn, const ble_gatt_error *err, ble_gatt_attr *attr, void *arg) {
+  GattCtx *c = (GattCtx *)arg;
+  c->status = err->status;
+  xSemaphoreGive(gattSem);
+  return 0;
+}
+
+bool gattWait() {
+  return xSemaphoreTake(gattSem, pdMS_TO_TICKS(8000)) == pdTRUE;
+}
+
+bool findService(uint16_t conn, const char *uuid, GattCtx &c) {
+  ble_uuid128_t u;
+  if (!uuidFromStr(uuid, u)) return false;
+  c = {};
+  if (ble_gattc_disc_svc_by_uuid(conn, &u.u, svcCb, &c) != 0) return false;
+  return gattWait() && c.status == 0 && c.start != 0;
+}
+
+bool findChars(uint16_t conn, GattCtx &c, const char *const *uuids, int n) {
+  c.nWant = n;
+  for (int i = 0; i < n; i++) {
+    uuidFromStr(uuids[i], c.want[i]);
+    c.found[i] = 0;
+  }
+  c.status = 0;
+  if (ble_gattc_disc_all_chrs(conn, c.start, c.end, chrCb, &c) != 0) return false;
+  return gattWait() && c.status == 0;
+}
+
+uint16_t findCccd(uint16_t conn, uint16_t valHandle, uint16_t end) {
+  GattCtx c = {};
+  if (valHandle == 0 || valHandle >= end) return 0;
+  if (ble_gattc_disc_all_dscs(conn, valHandle, end, dscCb, &c) != 0) return 0;
+  if (!gattWait()) return 0;
+  return c.cccd;
+}
+
+bool gattWrite(uint16_t conn, uint16_t handle, const uint8_t *data, uint16_t len) {
+  GattCtx c = {};
+  if (ble_gattc_write_flat(conn, handle, data, len, writeCb, &c) != 0) return false;
+  return gattWait() && c.status == 0;
+}
+
+void setupAncs(uint16_t conn) {
+  static const char *const chars[3] = {
+    "9FBF120D-6301-42D9-8C58-25E699A21DBD",
+    "69D1D8F3-45E1-49A8-9821-9BBDFDAAD9D9",
+    "22EAC6E9-24D6-4BB5-BE44-B36ACE7C7BFB"
+  };
+  GattCtx c;
+  if (!findService(conn, "7905F431-B5CE-4E99-A40F-4B1E122D00D0", c)) return;
+  if (!findChars(conn, c, chars, 3)) return;
+  ios.nsVal = c.found[0];
+  ios.cpVal = c.found[1];
+  ios.dsVal = c.found[2];
+  ios.dsCccd = findCccd(conn, ios.dsVal, c.end);
+  ios.nsCccd = findCccd(conn, ios.nsVal, c.end);
+  const uint8_t on[2] = { 1, 0 };
+  if (ios.dsCccd) gattWrite(conn, ios.dsCccd, on, 2);
+  if (ios.nsCccd) gattWrite(conn, ios.nsCccd, on, 2);
+}
+
+void setupAms(uint16_t conn) {
+  static const char *const chars[2] = {
+    "9B3C81D8-57B1-4A8A-B8DF-0E56F7CA51C2",
+    "2F7CABCE-808D-411F-9A0C-BB92BA96C102"
+  };
+  GattCtx c;
+  if (!findService(conn, "89D3502B-0F36-433A-8EF4-C502AD55F8DC", c)) return;
+  if (!findChars(conn, c, chars, 2)) return;
+  ios.rcVal = c.found[0];
+  ios.euVal = c.found[1];
+  ios.euCccd = findCccd(conn, ios.euVal, c.end);
+  const uint8_t on[2] = { 1, 0 };
+  if (!ios.euCccd || !gattWrite(conn, ios.euCccd, on, 2)) return;
+  const uint8_t track[3] = { 2, 0, 2 };
+  const uint8_t player[2] = { 0, 1 };
+  gattWrite(conn, ios.euVal, track, 3);
+  gattWrite(conn, ios.euVal, player, 2);
+  portENTER_CRITICAL(&musicMux);
+  musicShared.available = true;
+  portEXIT_CRITICAL(&musicMux);
+}
+
+int gapListener(ble_gap_event *ev, void *arg) {
+  switch (ev->type) {
+    case BLE_GAP_EVENT_ENC_CHANGE:
+      if (ev->enc_change.status == 0 && ev->enc_change.conn_handle == connHandle) {
+        linkEncrypted = true;
+        xSemaphoreGive(encSem);
+      }
+      break;
+    case BLE_GAP_EVENT_NOTIFY_RX: {
+      if (ev->notify_rx.conn_handle != connHandle || !ev->notify_rx.om) break;
+      RxItem it;
+      uint16_t len = OS_MBUF_PKTLEN(ev->notify_rx.om);
+      if (len > sizeof(it.data) - 3) len = sizeof(it.data) - 3;
+      it.data[0] = 0xA0;
+      it.data[1] = ev->notify_rx.attr_handle & 0xFF;
+      it.data[2] = ev->notify_rx.attr_handle >> 8;
+      os_mbuf_copydata(ev->notify_rx.om, 0, len, it.data + 3);
+      it.len = len + 3;
+      xQueueSend(rxQueue, &it, 0);
+      break;
+    }
+    case BLE_GAP_EVENT_DISCONNECT:
+      linkEncrypted = false;
+      break;
+    default:
+      break;
+  }
+  return 0;
+}
+
+ble_gap_event_listener gapListenerObj;
+
+void iosTask(void *) {
+  for (;;) {
+    while (connHandle == 0xFFFF) vTaskDelay(pdMS_TO_TICKS(300));
+    uint16_t conn = connHandle;
+    vTaskDelay(pdMS_TO_TICKS(2500));
+    if (connHandle != conn) continue;
+    ios = {};
+    dsLen = 0;
+    xSemaphoreTake(encSem, 0);
+    if (!linkEncrypted) {
+      ble_gap_security_initiate(conn);
+      xSemaphoreTake(encSem, pdMS_TO_TICKS(40000));
+    }
+    if (linkEncrypted && connHandle == conn) {
+      setupAncs(conn);
+      setupAms(conn);
+    }
+    while (connHandle == conn) vTaskDelay(pdMS_TO_TICKS(500));
+    portENTER_CRITICAL(&musicMux);
+    musicShared = {};
+    portEXIT_CRITICAL(&musicMux);
+    ios = {};
+  }
+}
+
+const char *appName(const char *id) {
+  static const char *const map[][2] = {
+    { "net.whatsapp.WhatsApp", "WhatsApp" },
+    { "net.whatsapp.WhatsAppSMB", "WhatsApp Business" },
+    { "com.apple.MobileSMS", "Mensagens" },
+    { "com.apple.mobilephone", "Telefone" },
+    { "com.apple.facetime", "FaceTime" },
+    { "ph.telegra.Telegraph", "Telegram" },
+    { "com.burbn.instagram", "Instagram" },
+    { "com.google.Gmail", "Gmail" },
+    { "com.apple.mobilemail", "Mail" },
+    { "com.microsoft.skype.teams", "Teams" },
+    { "com.tinyspeck.chatlyio", "Slack" }
+  };
+  for (auto &m : map) {
+    if (strcmp(id, m[0]) == 0) return m[1];
+  }
+  const char *dot = strrchr(id, '.');
+  return dot ? dot + 1 : id;
+}
+
+void requestAttributes(uint32_t uid) {
+  if (!ios.cpVal || connHandle == 0xFFFF) return;
+  uint8_t cmd[] = { 0, (uint8_t)uid, (uint8_t)(uid >> 8), (uint8_t)(uid >> 16), (uint8_t)(uid >> 24), 0, 1, 48, 0, 3, 120, 0 };
+  dsLen = 0;
+  ble_gattc_write_flat(connHandle, ios.cpVal, cmd, sizeof(cmd), nullptr, nullptr);
+}
+
+void handleNotificationSource(const uint8_t *p, uint16_t n) {
+  if (n < 8) return;
+  uint8_t ev = p[0], flags = p[1], cat = p[2];
+  uint32_t uid = rd32(p + 4);
+  if (ev == 2) {
+    portENTER_CRITICAL(&toastMux);
+    if (toastShared.active && toastShared.uid == uid && toastShared.call) toastShared.active = false;
+    portEXIT_CRITICAL(&toastMux);
+    navDirty = true;
+    return;
+  }
+  if (ev != 0 || (flags & 0x04) || !setNotify) return;
+  if (cat != 1 && cat != 2 && cat != 4) return;
+  pendingUid = uid;
+  pendingCat = cat;
+  requestAttributes(uid);
+}
+
+void handleDataSource(const uint8_t *p, uint16_t n) {
+  if (dsLen + n > sizeof(dsBuf)) dsLen = 0;
+  memcpy(dsBuf + dsLen, p, n);
+  dsLen += n;
+  if (dsLen < 5 || dsBuf[0] != 0) return;
+  uint32_t uid = rd32(dsBuf + 1);
+  uint16_t off = 5;
+  char vals[3][128] = {};
+  int got = 0;
+  while (got < 3) {
+    if (off + 3 > dsLen) return;
+    uint8_t id = dsBuf[off];
+    uint16_t len = rd16(dsBuf + off + 1);
+    if (off + 3 + len > dsLen) return;
+    int slot = id == 0 ? 0 : (id == 1 ? 1 : 2);
+    uint16_t cl = min<uint16_t>(len, 127);
+    memcpy(vals[slot], dsBuf + off + 3, cl);
+    vals[slot][cl] = 0;
+    off += 3 + len;
+    got++;
+  }
+  dsLen = 0;
+  if (uid != pendingUid) return;
+  Toast t = {};
+  t.active = true;
+  t.call = pendingCat == 1;
+  t.uid = uid;
+  t.until = millis() + (t.call ? 30000 : 8000);
+  strncpy(t.app, appName(vals[0]), sizeof(t.app) - 1);
+  strncpy(t.title, vals[1], sizeof(t.title) - 1);
+  strncpy(t.msg, vals[2], sizeof(t.msg) - 1);
+  if (pendingCat == 2) strncpy(t.msg, "Ligação perdida", sizeof(t.msg) - 1);
+  portENTER_CRITICAL(&toastMux);
+  toastShared = t;
+  portEXIT_CRITICAL(&toastMux);
+  lastActivity = millis();
+  navDirty = true;
+}
+
+void handleEntityUpdate(const uint8_t *p, uint16_t n) {
+  if (n < 3) return;
+  uint8_t entity = p[0], attr = p[1];
+  char v[64];
+  uint16_t l = min<uint16_t>(n - 3, sizeof(v) - 1);
+  memcpy(v, p + 3, l);
+  v[l] = 0;
+  portENTER_CRITICAL(&musicMux);
+  if (entity == 2 && attr == 0) strncpy(musicShared.artist, v, sizeof(musicShared.artist) - 1);
+  if (entity == 2 && attr == 2) strncpy(musicShared.title, v, sizeof(musicShared.title) - 1);
+  if (entity == 0 && attr == 1) musicShared.playing = v[0] == '1';
+  portEXIT_CRITICAL(&musicMux);
+  navDirty = true;
+}
+
+void handleIosNotify(const uint8_t *p, uint16_t n) {
+  if (n < 3) return;
+  uint16_t h = p[1] | (p[2] << 8);
+  const uint8_t *d = p + 3;
+  uint16_t dl = n - 3;
+  if (h == ios.nsVal) handleNotificationSource(d, dl);
+  else if (h == ios.dsVal) handleDataSource(d, dl);
+  else if (h == ios.euVal) handleEntityUpdate(d, dl);
+}
+
+void musicCommand(uint8_t cmd) {
+  if (!ios.rcVal || connHandle == 0xFFFF) return;
+  ble_gattc_write_flat(connHandle, ios.rcVal, &cmd, 1, nullptr, nullptr);
+}
+
 void rxTask(void *) {
   RxItem it;
   for (;;) {
@@ -557,6 +1078,12 @@ void rxTask(void *) {
       case 0x01: handleNavPacket(it.data, it.len); break;
       case 0x02: handlePosPacket(it.data, it.len); break;
       case 0x03: handleAlertPacket(it.data, it.len); break;
+      case 0x04: handleStatusPacket(it.data, it.len); break;
+      case 0x05: handleSettingsPacket(it.data, it.len); break;
+      case 0x20:
+      case 0x21:
+      case 0x22: handleOtaPacket(it.data, it.len); break;
+      case 0xA0: handleIosNotify(it.data, it.len); break;
       case 0x10:
       case 0x11:
       case 0x12: handleMapPacket(it.data, it.len); break;
@@ -566,12 +1093,17 @@ void rxTask(void *) {
 }
 
 class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *s) override {
+  void onConnect(BLEServer *s, ble_gap_conn_desc *desc) override {
     bleConnected = true;
+    connHandle = desc->conn_handle;
+    linkEncrypted = desc->sec_state.encrypted;
+    lastActivity = millis();
     navDirty = true;
   }
-  void onDisconnect(BLEServer *s) override {
+  void onDisconnect(BLEServer *s, ble_gap_conn_desc *desc) override {
     bleConnected = false;
+    connHandle = 0xFFFF;
+    linkEncrypted = false;
     navDirty = true;
     BLEDevice::startAdvertising();
   }
@@ -585,7 +1117,7 @@ class RxCallbacks : public BLECharacteristicCallbacks {
     if (n > sizeof(it.data)) n = sizeof(it.data);
     it.len = n;
     memcpy(it.data, c->getData(), n);
-    xQueueSend(rxQueue, &it, pdMS_TO_TICKS(200));
+    xQueueSend(rxQueue, &it, pdMS_TO_TICKS(it.data[0] >= 0x20 && it.data[0] <= 0x22 ? 1500 : 200));
   }
 };
 
@@ -600,11 +1132,24 @@ void bleInit() {
   nav->setCallbacks(cb);
   BLECharacteristic *map = svc->createCharacteristic(MAP_CHAR_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
   map->setCallbacks(cb);
+  BLECharacteristic *ota = svc->createCharacteristic(OTA_CHAR_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  ota->setCallbacks(cb);
+  infoChar = svc->createCharacteristic(INFO_CHAR_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  char info[32];
+  snprintf(info, sizeof(info), "fw=%d", FW_VERSION);
+  infoChar->setValue((uint8_t *)info, strlen(info));
   svc->start();
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(SERVICE_UUID);
   adv->setScanResponse(true);
   BLEDevice::startAdvertising();
+  ble_hs_cfg.sm_bonding = 1;
+  ble_hs_cfg.sm_mitm = 0;
+  ble_hs_cfg.sm_sc = 1;
+  ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
+  ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+  ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+  ble_gap_event_listener_register(&gapListenerObj, gapListener, nullptr);
 }
 
 int textWidth(const char *s) {
@@ -849,11 +1394,141 @@ bool curveActive(AlertData &a) {
   return a.type == 1 && millis() - a.ms < 5000 && a.dist <= 300;
 }
 
+bool statusFresh(StatusData &st) {
+  portENTER_CRITICAL(&statusMux);
+  st = statusShared;
+  portEXIT_CRITICAL(&statusMux);
+  return st.ms != 0 && millis() - st.ms < 10000;
+}
+
+bool overSpeed(float kmh) {
+  StatusData st;
+  return statusFresh(st) && st.limit > 0 && kmh > st.limit + 3;
+}
+
+void drawLimitSign(int x, int y, uint8_t limit, bool over) {
+  bool flash = over && (millis() / 400) % 2 == 0;
+  gfx->fillCircle(x, y, 31, flash ? C_YELLOW : C_RED);
+  gfx->fillCircle(x, y, 24, RGB565_WHITE);
+  char b[6];
+  snprintf(b, sizeof(b), "%u", limit);
+  const uint8_t *f = limit >= 100 ? u8g2_font_helvB18_tf : u8g2_font_helvB24_tf;
+  gfx->setFont(f);
+  int w = textWidth(b);
+  textAt(b, x - w / 2, y + (limit >= 100 ? 7 : 9), f, RGB565_BLACK);
+}
+
+void drawRadarBadge(int x, int y, uint16_t dist) {
+  gfx->fillCircle(x, y, 30, 0x2104);
+  for (int r = 28; r <= 30; r++) gfx->drawCircle(x, y, r, C_ORANGE);
+  gfx->fillRoundRect(x - 14, y - 12, 28, 18, 4, C_ORANGE);
+  gfx->fillCircle(x, y - 3, 6, 0x2104);
+  gfx->fillCircle(x, y - 3, 3, C_ORANGE);
+  gfx->fillRect(x - 4, y + 6, 8, 8, C_ORANGE);
+  char b[16];
+  snprintf(b, sizeof(b), "%u m", (unsigned)((dist / 10) * 10));
+  gfx->setFont(u8g2_font_helvB14_tf);
+  int w = textWidth(b);
+  textAt(b, x - w / 2, y + 50, u8g2_font_helvB14_tf, C_ORANGE);
+}
+
+void drawStatusBadges(int limitX, int limitY, int radarX, int radarY, float kmh) {
+  StatusData st;
+  if (!statusFresh(st)) return;
+  if (st.limit > 0) drawLimitSign(limitX, limitY, st.limit, kmh > st.limit + 3);
+  if (st.radarDist != 0xFFFF && st.radarDist <= 500) drawRadarBadge(radarX, radarY, st.radarDist);
+}
+
+void drawToast() {
+  Toast t;
+  portENTER_CRITICAL(&toastMux);
+  if (toastShared.active && (int32_t)(millis() - toastShared.until) > 0) toastShared.active = false;
+  t = toastShared;
+  portEXIT_CRITICAL(&toastMux);
+  if (!t.active) return;
+  gfx->fillRoundRect(38, 250, LCD_W - 76, 170, 26, 0x18E3);
+  gfx->drawRoundRect(38, 250, LCD_W - 76, 170, 26, t.call ? C_GREEN : C_ACCENT);
+  char b[140];
+  if (t.call) {
+    textCentered("Ligação", 290, u8g2_font_helvB18_tf, C_GREEN);
+    strncpy(b, t.title, sizeof(b) - 1);
+    b[sizeof(b) - 1] = 0;
+    gfx->setFont(u8g2_font_helvB24_tf);
+    fitText(b, 330);
+    textCentered(b, 335, u8g2_font_helvB24_tf, C_FG);
+    textCentered(t.app, 375, u8g2_font_helvB14_tf, C_DIM);
+    return;
+  }
+  textCentered(t.app, 282, u8g2_font_helvB14_tf, C_ACCENT);
+  strncpy(b, t.title, sizeof(b) - 1);
+  b[sizeof(b) - 1] = 0;
+  gfx->setFont(u8g2_font_helvB18_tf);
+  fitText(b, 340);
+  textCentered(b, 314, u8g2_font_helvB18_tf, C_FG);
+  wrapCentered(t.msg, 358, 26, 340, 2, u8g2_font_helvB18_tf, C_DIM);
+}
+
+void drawPlayIcon(int x, int y, bool playing, uint16_t c) {
+  if (playing) {
+    gfx->fillRect(x - 13, y - 16, 9, 32, c);
+    gfx->fillRect(x + 4, y - 16, 9, 32, c);
+  } else {
+    gfx->fillTriangle(x - 10, y - 17, x - 10, y + 17, x + 16, y, c);
+  }
+}
+
+void drawSkipIcon(int x, int y, bool next, uint16_t c) {
+  int d = next ? 1 : -1;
+  gfx->fillTriangle(x - 12 * d, y - 13, x - 12 * d, y + 13, x + 4 * d, y, c);
+  gfx->fillTriangle(x - 2 * d, y - 13, x - 2 * d, y + 13, x + 14 * d, y, c);
+  gfx->fillRect(d > 0 ? x + 14 : x - 17, y - 13, 3, 26, c);
+}
+
+void drawMusicScreen() {
+  gfx->fillScreen(C_BG);
+  Music m;
+  portENTER_CRITICAL(&musicMux);
+  m = musicShared;
+  portEXIT_CRITICAL(&musicMux);
+  textCentered("Música", 70, u8g2_font_helvB18_tf, C_DIM);
+  if (!m.available) {
+    wrapCentered("Aceite o pareamento no iPhone para controlar a música", 210, 30, 320, 3, u8g2_font_helvB18_tf, C_DIM);
+  } else if (m.title[0] == 0) {
+    textCentered("Nada tocando", 200, u8g2_font_helvB24_tf, C_DIM);
+  } else {
+    wrapCentered(m.title, 175, 32, 340, 2, u8g2_font_helvB24_tf, C_FG);
+    char a[64];
+    strncpy(a, m.artist, sizeof(a) - 1);
+    a[sizeof(a) - 1] = 0;
+    gfx->setFont(u8g2_font_helvB18_tf);
+    fitText(a, 320);
+    textCentered(a, 245, u8g2_font_helvB18_tf, C_ACCENT);
+  }
+  uint16_t c = m.available ? C_FG : 0x4208;
+  gfx->drawCircle(CX - 115, 345, 38, 0x4208);
+  gfx->fillCircle(CX, 345, 44, m.available ? C_ACCENT : 0x4208);
+  gfx->drawCircle(CX + 115, 345, 38, 0x4208);
+  drawSkipIcon(CX - 115, 345, false, c);
+  drawPlayIcon(CX, 345, m.playing, RGB565_BLACK);
+  drawSkipIcon(CX + 115, 345, true, c);
+}
+
+void drawOtaScreen() {
+  gfx->fillScreen(C_BG);
+  textCentered("Atualizando a placa", 170, u8g2_font_helvB24_tf, C_FG);
+  char b[16];
+  snprintf(b, sizeof(b), "%d%%", (int)otaProgress);
+  textCentered(b, 260, u8g2_font_logisoso42_tr, C_ACCENT);
+  gfx->drawRoundRect(83, 300, 300, 22, 11, C_DIM);
+  gfx->fillRoundRect(85, 302, max(12, (int)(296 * otaProgress / 100)), 18, 9, C_ACCENT);
+  textCentered("Não desligue", 370, u8g2_font_helvB18_tf, C_DIM);
+}
+
 void drawNavScreen(const NavData &n) {
   gfx->fillScreen(C_BG);
   char b[48];
   snprintf(b, sizeof(b), "%u km/h", n.speedKmh);
-  textCentered(b, 62, u8g2_font_helvB18_tf, C_DIM);
+  textCentered(b, 62, u8g2_font_helvB18_tf, overSpeed(n.speedKmh) ? C_RED : C_DIM);
   if (n.maneuver == M_ARRIVE && n.distM < 30) {
     textCentered("Chegou", 120, u8g2_font_logisoso42_tr, C_GREEN);
   } else {
@@ -863,6 +1538,7 @@ void drawNavScreen(const NavData &n) {
   drawManeuver(n, CX, 220, 1.0f, C_BG);
   AlertData a;
   if (curveActive(a)) drawCurveBadge(CX + 150, 220, a.angle, a.dist);
+  drawStatusBadges(CX - 150, 200, CX - 150, 290, n.speedKmh);
   if (n.flags & 0x01) {
     textCentered("Recalculando...", 372, u8g2_font_helvB24_tf, C_ORANGE);
   } else {
@@ -890,6 +1566,11 @@ void drawIdleScreen(const GpsData &g, bool connected) {
     snprintf(b, sizeof(b), "--:--");
   }
   textCentered(b, 80, u8g2_font_helvB24_tf, C_FG);
+  int bp = batteryPct;
+  if (bp >= 0) {
+    snprintf(b, sizeof(b), charging ? "Bateria %d%% +" : "Bateria %d%%", bp);
+    textCentered(b, 118, u8g2_font_helvB14_tf, bp < 15 && !charging ? C_ORANGE : C_DIM);
+  }
   if (g.fix) snprintf(b, sizeof(b), "%d", (int)roundf(g.kmph));
   else snprintf(b, sizeof(b), "0");
   textCentered(b, 280, u8g2_font_logisoso92_tn, g.fix ? C_FG : C_DIM);
@@ -952,10 +1633,10 @@ void wideSeg(float x0, float y0, float x1, float y1, float w, uint16_t c, bool c
 void roadStyle(uint8_t kind, float mpp, float &w, uint16_t &c) {
   float z = constrain(1.2f / mpp, 0.5f, 1.4f);
   switch (kind) {
-    case 1: w = 9 * z; c = 0x9CD3; break;
-    case 2: w = 7 * z; c = 0x7BEF; break;
-    case 3: w = 5 * z; c = 0x5AEB; break;
-    default: w = 4 * z; c = 0x4208; break;
+    case 1: w = 9 * z; c = nightMode ? 0x5AEB : 0x9CD3; break;
+    case 2: w = 7 * z; c = nightMode ? 0x4A49 : 0x7BEF; break;
+    case 3: w = 5 * z; c = nightMode ? 0x31A6 : 0x5AEB; break;
+    default: w = 4 * z; c = nightMode ? 0x2104 : 0x4208; break;
   }
 }
 
@@ -967,32 +1648,52 @@ void drawPositionMarker() {
 }
 
 void drawMapOverlay(const NavData &n, float speedKmh) {
+  bool cruise = n.flags & 0x02;
   uint16_t panelBg = C_PANEL;
-  if (approaching) panelBg = blinkOn() ? 0xC300 : C_PANEL;
+  if (approaching && !cruise) panelBg = blinkOn() ? 0xC300 : C_PANEL;
   gfx->fillRect(0, 0, LCD_W, 150, panelBg);
   gfx->drawFastHLine(0, 150, LCD_W, 0x2104);
-  char b[48];
-  NavData mini = n;
-  drawManeuver(mini, CX - 115, 92, 0.42f, panelBg);
-  if (n.maneuver == M_ARRIVE && n.distM < 30) {
-    textAt("Chegou", CX - 65, 108, u8g2_font_logisoso42_tr, C_GREEN);
+  char b[128];
+  if (cruise) {
+    GpsData g;
+    portENTER_CRITICAL(&gpsMux);
+    g = gpsShared;
+    portEXIT_CRITICAL(&gpsMux);
+    if (g.timeValid) {
+      snprintf(b, sizeof(b), "%02u:%02u", g.hour, g.minute);
+      textCentered(b, 70, u8g2_font_helvB18_tf, C_DIM);
+    }
+    StatusData st;
+    const char *street = statusFresh(st) && st.street[0] ? st.street : n.text;
+    strncpy(b, street, sizeof(b) - 1);
+    b[sizeof(b) - 1] = 0;
+    gfx->setFont(u8g2_font_helvB24_tf);
+    fitText(b, 320);
+    textCentered(b, 125, u8g2_font_helvB24_tf, C_ACCENT);
   } else {
-    formatDistance(n.distM, b, sizeof(b));
-    textAt(b, CX - 65, 108, u8g2_font_logisoso42_tr, C_FG);
+    NavData mini = n;
+    drawManeuver(mini, CX - 115, 92, 0.42f, panelBg);
+    if (n.maneuver == M_ARRIVE && n.distM < 30) {
+      textAt("Chegou", CX - 65, 108, u8g2_font_logisoso42_tr, C_GREEN);
+    } else {
+      formatDistance(n.distM, b, sizeof(b));
+      textAt(b, CX - 65, 108, u8g2_font_logisoso42_tr, C_FG);
+    }
+    if (n.flags & 0x01) {
+      textCentered("Recalculando...", 140, u8g2_font_helvB18_tf, C_ORANGE);
+    } else {
+      strncpy(b, n.text, sizeof(b) - 1);
+      b[sizeof(b) - 1] = 0;
+      gfx->setFont(u8g2_font_helvB18_tf);
+      fitText(b, 300);
+      textCentered(b, 140, u8g2_font_helvB18_tf, C_ACCENT);
+    }
   }
-  if (n.flags & 0x01) {
-    textCentered("Recalculando...", 140, u8g2_font_helvB18_tf, C_ORANGE);
-  } else {
-    char s[128];
-    strncpy(s, n.text, sizeof(s) - 1);
-    s[sizeof(s) - 1] = 0;
-    gfx->setFont(u8g2_font_helvB18_tf);
-    fitText(s, 300);
-    textCentered(s, 140, u8g2_font_helvB18_tf, C_ACCENT);
-  }
-  gfx->fillRoundRect(CX - 62, 410, 124, 40, 20, C_PANEL);
+  bool over = overSpeed(speedKmh);
+  gfx->fillRoundRect(CX - 62, 410, 124, 40, 20, over ? C_RED : C_PANEL);
   snprintf(b, sizeof(b), "%d km/h", (int)roundf(speedKmh));
   textCentered(b, 438, u8g2_font_helvB18_tf, C_FG);
+  drawStatusBadges(CX + 125, 380, CX + 125, 290, speedKmh);
 }
 
 float routePointAt(const RouteData &m, float along, float &x, float &y) {
@@ -1134,6 +1835,8 @@ void setup() {
   Serial.begin(115200);
   i2cMutex = xSemaphoreCreateMutex();
   mapMutex = xSemaphoreCreateMutex();
+  gattSem = xSemaphoreCreateBinary();
+  encSem = xSemaphoreCreateBinary();
   rxQueue = xQueueCreate(96, sizeof(RxItem));
   Wire.setBufferSize(GPS_CHUNK);
   Wire.begin(IIC_SDA, IIC_SCL, 100000);
@@ -1152,17 +1855,27 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(TP_INT), onTouch, FALLING);
   }
   pinMode(BOOT_BTN, INPUT_PULLUP);
+  pmuOk = pmu.begin(Wire, AXP2101_SLAVE_ADDRESS, IIC_SDA, IIC_SCL);
+  if (pmuOk) {
+    pmu.enableBattDetection();
+    pmu.enableBattVoltageMeasure();
+  }
+  lastActivity = millis();
   xTaskCreatePinnedToCore(rxTask, "rx", 8192, nullptr, 3, nullptr, 0);
   xTaskCreatePinnedToCore(gpsTask, "gps", 8192, nullptr, 1, nullptr, 0);
   bleInit();
+  xTaskCreatePinnedToCore(iosTask, "ios", 6144, nullptr, 2, nullptr, 0);
 }
 
-bool checkToggle(uint32_t now) {
-  static uint32_t lastToggle = 0;
+Tap readInput(uint32_t now) {
+  static uint32_t lastTap = 0;
   static bool lastBtn = true;
-  bool toggle = false;
+  Tap t = {};
   bool btn = digitalRead(BOOT_BTN);
-  if (lastBtn && !btn) toggle = true;
+  if (lastBtn && !btn) {
+    t.tapped = true;
+    t.button = true;
+  }
   lastBtn = btn;
   if (touchPending) {
     touchPending = false;
@@ -1171,14 +1884,54 @@ bool checkToggle(uint32_t now) {
       xSemaphoreTake(i2cMutex, portMAX_DELAY);
       uint8_t pts = touch.getPoint(x, y, 1);
       xSemaphoreGive(i2cMutex);
-      if (pts > 0) toggle = true;
+      if (pts > 0) {
+        t.tapped = true;
+        t.x = x[0];
+        t.y = y[0];
+      }
     }
   }
-  if (toggle && now - lastToggle > 500) {
-    lastToggle = now;
-    return true;
+  if (t.tapped && now - lastTap < 350) t.tapped = false;
+  if (t.tapped) lastTap = now;
+  return t;
+}
+
+uint8_t screensFor(uint8_t mode, uint8_t *list) {
+  if (mode == 0) {
+    list[0] = SCR_IDLE;
+    list[1] = SCR_MUSIC;
+    return 2;
   }
-  return false;
+  if (mode == 2) {
+    list[0] = SCR_MAP;
+    list[1] = SCR_MUSIC;
+    return 2;
+  }
+  list[0] = SCR_MAP;
+  list[1] = SCR_ARROW;
+  list[2] = SCR_MUSIC;
+  return 3;
+}
+
+void applyDisplaySettings(uint32_t now) {
+  bool fromPhone = settingsMs != 0 && now - settingsMs < 300000;
+  uint8_t bright;
+  if (fromPhone) {
+    nightMode = setNight;
+    bright = setBrightnessVal;
+  } else {
+    GpsData g;
+    portENTER_CRITICAL(&gpsMux);
+    g = gpsShared;
+    portEXIT_CRITICAL(&gpsMux);
+    nightMode = g.timeValid && (g.hour >= 19 || g.hour < 6);
+    bright = nightMode ? 110 : 255;
+  }
+  if (screenOff) bright = 0;
+  if (bright != appliedBrightness) {
+    panel->setBrightness(bright);
+    appliedBrightness = bright;
+  }
 }
 
 void loop() {
@@ -1190,19 +1943,64 @@ void loop() {
   n = navShared;
   portEXIT_CRITICAL(&navMux);
   bool navOn = n.active && bleConnected && (now - lastNavMs < NAV_TIMEOUT_MS);
-  if (navOn && isTurn(n.maneuver) && n.distM <= 150 && !(n.flags & 0x01)) {
+  bool cruise = navOn && (n.flags & 0x02);
+  uint8_t mode = !navOn ? 0 : (cruise ? 2 : 1);
+  if (mode == 1 && isTurn(n.maneuver) && n.distM <= 150 && !(n.flags & 0x01)) {
     if (!approaching) {
       approaching = true;
       approachStart = now;
       navDirty = true;
     }
-  } else if (!navOn || n.distM > 180 || !isTurn(n.maneuver)) {
+  } else if (mode != 1 || n.distM > 180 || !isTurn(n.maneuver)) {
     approaching = false;
   }
-
-  if (checkToggle(now) && navOn) {
-    showMap = !showMap;
+  if (mode != lastMode) {
+    lastMode = mode;
+    screenIdx = 0;
     navDirty = true;
+    lastActivity = now;
+  }
+  uint8_t list[3];
+  uint8_t count = screensFor(mode, list);
+  if (screenIdx >= count) screenIdx = 0;
+
+  Tap tp = readInput(now);
+  if (tp.tapped) {
+    bool wasOff = screenOff;
+    lastActivity = now;
+    screenOff = false;
+    navDirty = true;
+    bool toastOn;
+    portENTER_CRITICAL(&toastMux);
+    toastOn = toastShared.active;
+    portEXIT_CRITICAL(&toastMux);
+    if (wasOff) {
+    } else if (toastOn) {
+      portENTER_CRITICAL(&toastMux);
+      toastShared.active = false;
+      portEXIT_CRITICAL(&toastMux);
+    } else if (list[screenIdx] == SCR_MUSIC && !tp.button && tp.y > 290) {
+      if (tp.x < CX - 60) musicCommand(4);
+      else if (tp.x > CX + 60) musicCommand(3);
+      else musicCommand(2);
+    } else {
+      screenIdx = (screenIdx + 1) % count;
+    }
+  }
+
+  GpsData g;
+  portENTER_CRITICAL(&gpsMux);
+  g = gpsShared;
+  portEXIT_CRITICAL(&gpsMux);
+  if (mode != 0 || otaActive || (g.fix && g.kmph > 5)) lastActivity = now;
+  if (!screenOff && now - lastActivity > SLEEP_AFTER_MS) {
+    screenOff = true;
+    navDirty = true;
+  }
+  applyDisplaySettings(now);
+  if (screenOff) {
+    delay(20);
+    return;
   }
 
   PosTarget t;
@@ -1210,9 +2008,11 @@ void loop() {
   t = posShared;
   portEXIT_CRITICAL(&posMux);
   bool mapReady = world.hasSession && t.valid && t.mapId == world.session && (now - t.ms) < 10000;
-  bool animating = navOn && showMap && mapReady;
+  uint8_t scr = list[screenIdx];
+  bool animating = mode != 0 && scr == SCR_MAP && mapReady && !otaActive;
 
-  uint32_t interval = animating ? 40 : (approaching ? 100 : (navOn ? 250 : 1000));
+  uint32_t interval = animating ? 40 : (approaching ? 100 : (mode != 0 ? 250 : 1000));
+  if (otaActive) interval = 200;
   if (!navDirty && now - lastDraw < interval) {
     delay(5);
     return;
@@ -1220,14 +2020,17 @@ void loop() {
   navDirty = false;
   lastDraw = now;
 
-  if (!navOn) {
+  if (otaActive) {
+    drawOtaScreen();
+    gfx->flush();
+    return;
+  }
+  if (scr == SCR_MUSIC) {
+    drawMusicScreen();
+  } else if (mode == 0) {
     cam.init = false;
-    GpsData g;
-    portENTER_CRITICAL(&gpsMux);
-    g = gpsShared;
-    portEXIT_CRITICAL(&gpsMux);
     drawIdleScreen(g, bleConnected);
-  } else if (!showMap) {
+  } else if (scr == SCR_ARROW) {
     drawNavScreen(n);
   } else if (mapReady) {
     drawMapScreen(n, t, now);
@@ -1238,6 +2041,7 @@ void loop() {
     else snprintf(msg, sizeof(msg), "Aguardando mapa...");
     drawWaitingMap(n, msg);
   }
-  if (navOn) drawAlertRing();
+  if (mode == 1) drawAlertRing();
+  drawToast();
   gfx->flush();
 }

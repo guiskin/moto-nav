@@ -145,6 +145,25 @@ enum OverpassClient {
     struct Way {
         let kind: UInt8
         let points: [CLLocationCoordinate2D]
+        let maxspeed: Int?
+        let name: String?
+    }
+
+    struct Camera {
+        let coordinate: CLLocationCoordinate2D
+        let maxspeed: Int?
+    }
+
+    struct Result {
+        let ways: [Way]
+        let cameras: [Camera]
+    }
+
+    static func parseSpeed(_ s: String?) -> Int? {
+        guard let s = s?.trimmingCharacters(in: .whitespaces), !s.isEmpty else { return nil }
+        let digits = s.prefix { $0.isNumber }
+        guard let v = Int(digits), v > 0, v < 200 else { return nil }
+        return s.lowercased().contains("mph") ? Int((Double(v) * 1.609).rounded()) : v
     }
 
     struct BBox {
@@ -163,6 +182,8 @@ enum OverpassClient {
             let type: String
             let tags: [String: String]?
             let geometry: [LatLon]?
+            let lat: Double?
+            let lon: Double?
         }
         let elements: [Element]
     }
@@ -183,12 +204,12 @@ enum OverpassClient {
         }
     }
 
-    static func fetchWays(in boxes: [BBox]) async throws -> [Way] {
-        guard !boxes.isEmpty else { return [] }
+    static func fetchWays(in boxes: [BBox]) async throws -> Result {
+        guard !boxes.isEmpty else { return Result(ways: [], cameras: []) }
         let filter = "^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|road|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"
         let parts = boxes.map { b -> String in
             let box = String(format: "%.5f,%.5f,%.5f,%.5f", b.south, b.west, b.north, b.east)
-            return "way[\"highway\"~\"\(filter)\"](\(box));"
+            return "way[\"highway\"~\"\(filter)\"](\(box));node[\"highway\"=\"speed_camera\"](\(box));"
         }.joined()
         let query = "[out:json][timeout:25];(\(parts));out geom qt;"
         var allowed = CharacterSet.alphanumerics
@@ -210,11 +231,22 @@ enum OverpassClient {
                     continue
                 }
                 let decoded = try JSONDecoder().decode(Response.self, from: data)
-                return decoded.elements.compactMap { el in
+                var ways: [Way] = []
+                var cameras: [Camera] = []
+                for el in decoded.elements {
+                    if el.type == "node", let la = el.lat, let lo = el.lon {
+                        cameras.append(Camera(coordinate: CLLocationCoordinate2D(latitude: la, longitude: lo),
+                                              maxspeed: parseSpeed(el.tags?["maxspeed"])))
+                        continue
+                    }
                     guard el.type == "way", let hw = el.tags?["highway"], let k = kind(for: hw),
-                          let g = el.geometry, g.count >= 2 else { return nil }
-                    return Way(kind: k, points: g.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) })
+                          let g = el.geometry, g.count >= 2 else { continue }
+                    ways.append(Way(kind: k,
+                                    points: g.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) },
+                                    maxspeed: parseSpeed(el.tags?["maxspeed"]),
+                                    name: el.tags?["name"]))
                 }
+                return Result(ways: ways, cameras: cameras)
             } catch {
                 lastError = error
             }

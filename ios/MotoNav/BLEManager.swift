@@ -5,11 +5,17 @@ final class BLEManager: NSObject, ObservableObject {
     static let serviceUUID = CBUUID(string: "6E0A0001-7A3B-4C2D-9E1F-0B5A4D3C2B1A")
     static let navCharUUID = CBUUID(string: "6E0A0002-7A3B-4C2D-9E1F-0B5A4D3C2B1A")
     static let mapCharUUID = CBUUID(string: "6E0A0003-7A3B-4C2D-9E1F-0B5A4D3C2B1A")
+    static let infoCharUUID = CBUUID(string: "6E0A0004-7A3B-4C2D-9E1F-0B5A4D3C2B1A")
+    static let otaCharUUID = CBUUID(string: "6E0A0005-7A3B-4C2D-9E1F-0B5A4D3C2B1A")
     private static let savedPeripheralKey = "motonav.peripheral"
 
     @Published private(set) var isConnected = false
     @Published private(set) var statusText = "Procurando a placa..."
     @Published private(set) var uploadProgress: Double?
+    @Published private(set) var boardFirmware: Int?
+    @Published private(set) var otaRunning = false
+    @Published private(set) var otaProgress: Double = 0
+    @Published private(set) var otaMessage: String?
 
     var onReady: (() -> Void)?
 
@@ -17,11 +23,15 @@ final class BLEManager: NSObject, ObservableObject {
     private var peripheral: CBPeripheral?
     private var navChar: CBCharacteristic?
     private var mapChar: CBCharacteristic?
+    private var infoChar: CBCharacteristic?
+    private var otaChar: CBCharacteristic?
+    private var bulkTarget: CBCharacteristic?
+    private var otaTimeout: DispatchWorkItem?
     private var lastNavPacket: Data?
     private var bulkQueue: [Data] = []
     private var bulkTotal = 0
     private var bulkDone: (() -> Void)?
-    private var pendingBlobs: [(data: Data, done: (() -> Void)?)] = []
+    private var pendingBlobs: [(data: Data, ota: Bool, done: (() -> Void)?)] = []
     private var blobId: UInt16 = 1
 
     override init() {
@@ -57,17 +67,86 @@ final class BLEManager: NSObject, ObservableObject {
     func sendMap(blob: Data, priority: Bool, completion: (() -> Void)? = nil) {
         guard isConnected, mapChar != nil else { return }
         if priority {
-            pendingBlobs.insert((data: blob, done: completion), at: 0)
+            pendingBlobs.insert((data: blob, ota: false, done: completion), at: 0)
         } else {
-            pendingBlobs.append((data: blob, done: completion))
+            pendingBlobs.append((data: blob, ota: false, done: completion))
         }
         startNextBlob()
+    }
+
+    var supportsOTA: Bool { otaChar != nil }
+
+    func sendFirmware(_ image: Data) {
+        guard isConnected, otaChar != nil, !otaRunning else { return }
+        otaRunning = true
+        otaProgress = 0
+        otaMessage = "Enviando..."
+        pendingBlobs.insert((data: image, ota: true, done: { [weak self] in
+            self?.otaMessage = "Gravando na placa..."
+            self?.armOtaTimeout(20)
+        }), at: 0)
+        startNextBlob()
+    }
+
+    private func armOtaTimeout(_ seconds: Double) {
+        otaTimeout?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self = self, self.otaRunning else { return }
+            self.finishOta(ok: false, message: "A placa não respondeu")
+        }
+        otaTimeout = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: w)
+    }
+
+    private func finishOta(ok: Bool, message: String) {
+        otaTimeout?.cancel()
+        otaRunning = false
+        otaMessage = message
+        if ok { otaProgress = 1 }
+    }
+
+    private func handleInfo(_ text: String) {
+        if text.hasPrefix("fw=") {
+            boardFirmware = Int(text.dropFirst(3))
+        } else if text == "ota=ok" {
+            finishOta(ok: true, message: "Placa atualizada. Reiniciando...")
+        } else if text.hasPrefix("ota=err") {
+            bulkQueue.removeAll()
+            bulkTotal = 0
+            uploadProgress = nil
+            finishOta(ok: false, message: "Falha na atualização (\(text.dropFirst(8)))")
+            startNextBlob()
+        }
     }
 
     private func startNextBlob() {
         guard bulkQueue.isEmpty, bulkTotal == 0, !pendingBlobs.isEmpty else { return }
         let next = pendingBlobs.removeFirst()
         let blob = next.data
+        if next.ota {
+            var packets: [Data] = []
+            var begin = Data([0x20])
+            append(&begin, UInt32(blob.count))
+            packets.append(begin)
+            let chunk = max(1, maxPayload - 5)
+            var off = 0
+            while off < blob.count {
+                let end = min(blob.count, off + chunk)
+                var p = Data([0x21])
+                append(&p, UInt32(off))
+                p.append(blob.subdata(in: off..<end))
+                packets.append(p)
+                off = end
+            }
+            packets.append(Data([0x22]))
+            bulkQueue = packets
+            bulkTotal = packets.count
+            bulkDone = next.done
+            bulkTarget = otaChar
+            pump()
+            return
+        }
+        bulkTarget = mapChar
         blobId = blobId == UInt16.max ? 1 : blobId + 1
         let id = blobId
         var packets: [Data] = []
@@ -97,12 +176,17 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     private func pump() {
-        guard let p = peripheral, let c = mapChar, p.state == .connected else { return }
+        guard let p = peripheral, let c = bulkTarget, p.state == .connected else { return }
         while !bulkQueue.isEmpty && p.canSendWriteWithoutResponse {
             p.writeValue(bulkQueue.removeFirst(), for: c, type: .withoutResponse)
         }
         if bulkTotal > 0 {
-            uploadProgress = Double(bulkTotal - bulkQueue.count) / Double(bulkTotal)
+            let progress = Double(bulkTotal - bulkQueue.count) / Double(bulkTotal)
+            if c === otaChar {
+                otaProgress = progress
+            } else {
+                uploadProgress = progress
+            }
         }
         if bulkQueue.isEmpty && bulkTotal > 0 {
             bulkTotal = 0
@@ -146,6 +230,13 @@ final class BLEManager: NSObject, ObservableObject {
         isConnected = false
         navChar = nil
         mapChar = nil
+        infoChar = nil
+        otaChar = nil
+        bulkTarget = nil
+        if otaRunning && otaMessage != "Placa atualizada. Reiniciando..." {
+            otaRunning = false
+            otaMessage = "Conexão perdida durante a atualização"
+        }
         bulkQueue = []
         bulkTotal = 0
         bulkDone = nil
@@ -207,13 +298,20 @@ extension BLEManager: CBPeripheralDelegate {
             statusText = "Placa sem o serviço MotoNav"
             return
         }
-        peripheral.discoverCharacteristics([Self.navCharUUID, Self.mapCharUUID], for: svc)
+        peripheral.discoverCharacteristics([Self.navCharUUID, Self.mapCharUUID, Self.infoCharUUID, Self.otaCharUUID], for: svc)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         guard let c = service.characteristics?.first(where: { $0.uuid == Self.navCharUUID }) else { return }
         navChar = c
         mapChar = service.characteristics?.first(where: { $0.uuid == Self.mapCharUUID })
+        infoChar = service.characteristics?.first(where: { $0.uuid == Self.infoCharUUID })
+        otaChar = service.characteristics?.first(where: { $0.uuid == Self.otaCharUUID })
+        boardFirmware = nil
+        if let ic = infoChar {
+            peripheral.setNotifyValue(true, for: ic)
+            peripheral.readValue(for: ic)
+        }
         isConnected = true
         statusText = mapChar == nil ? "Placa conectada (atualize o firmware)" : "Placa conectada"
         if let last = lastNavPacket { send(last) }
@@ -222,5 +320,11 @@ extension BLEManager: CBPeripheralDelegate {
 
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
         pump()
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard characteristic.uuid == Self.infoCharUUID, let v = characteristic.value,
+              let text = String(data: v, encoding: .utf8) else { return }
+        handleInfo(text)
     }
 }
