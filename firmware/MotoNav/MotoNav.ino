@@ -1651,8 +1651,8 @@ void drawMapOverlay(const NavData &n, float speedKmh) {
   bool cruise = n.flags & 0x02;
   uint16_t panelBg = C_PANEL;
   if (approaching && !cruise) panelBg = blinkOn() ? 0xC300 : C_PANEL;
-  gfx->fillRect(0, 0, LCD_W, 150, panelBg);
-  gfx->drawFastHLine(0, 150, LCD_W, 0x2104);
+  gfx->fillRect(0, 0, LCD_W, 118, panelBg);
+  gfx->drawFastHLine(0, 118, LCD_W, 0x2104);
   char b[128];
   if (cruise) {
     GpsData g;
@@ -1661,32 +1661,32 @@ void drawMapOverlay(const NavData &n, float speedKmh) {
     portEXIT_CRITICAL(&gpsMux);
     if (g.timeValid) {
       snprintf(b, sizeof(b), "%02u:%02u", g.hour, g.minute);
-      textCentered(b, 70, u8g2_font_helvB18_tf, C_DIM);
+      textCentered(b, 58, u8g2_font_helvB14_tf, C_DIM);
     }
     StatusData st;
     const char *street = statusFresh(st) && st.street[0] ? st.street : n.text;
     strncpy(b, street, sizeof(b) - 1);
     b[sizeof(b) - 1] = 0;
     gfx->setFont(u8g2_font_helvB24_tf);
-    fitText(b, 320);
-    textCentered(b, 125, u8g2_font_helvB24_tf, C_ACCENT);
+    fitText(b, 300);
+    textCentered(b, 98, u8g2_font_helvB24_tf, C_ACCENT);
   } else {
     NavData mini = n;
-    drawManeuver(mini, CX - 115, 92, 0.42f, panelBg);
+    drawManeuver(mini, CX - 92, 64, 0.32f, panelBg);
     if (n.maneuver == M_ARRIVE && n.distM < 30) {
-      textAt("Chegou", CX - 65, 108, u8g2_font_logisoso42_tr, C_GREEN);
+      textAt("Chegou", CX - 52, 80, u8g2_font_logisoso32_tr, C_GREEN);
     } else {
       formatDistance(n.distM, b, sizeof(b));
-      textAt(b, CX - 65, 108, u8g2_font_logisoso42_tr, C_FG);
+      textAt(b, CX - 52, 80, u8g2_font_logisoso32_tr, C_FG);
     }
     if (n.flags & 0x01) {
-      textCentered("Recalculando...", 140, u8g2_font_helvB18_tf, C_ORANGE);
+      textCentered("Recalculando...", 108, u8g2_font_helvB14_tf, C_ORANGE);
     } else {
       strncpy(b, n.text, sizeof(b) - 1);
       b[sizeof(b) - 1] = 0;
-      gfx->setFont(u8g2_font_helvB18_tf);
-      fitText(b, 300);
-      textCentered(b, 140, u8g2_font_helvB18_tf, C_ACCENT);
+      gfx->setFont(u8g2_font_helvB14_tf);
+      fitText(b, 280);
+      textCentered(b, 108, u8g2_font_helvB14_tf, C_ACCENT);
     }
   }
   bool over = overSpeed(speedKmh);
