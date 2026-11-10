@@ -643,7 +643,7 @@ void handleSettingsPacket(const uint8_t *p, size_t n) {
   setBrightnessVal = max<uint8_t>(20, p[1]);
   setNight = p[2];
   setNotify = p[3];
-  settingsMs = millis() | 1;
+  settingsMs = millis() ? millis() : 1;
   navDirty = true;
 }
 
@@ -2012,10 +2012,27 @@ void applyDisplaySettings(uint32_t now) {
     nightMode = g.timeValid && (g.hour >= 19 || g.hour < 6);
     bright = nightMode ? 110 : 255;
   }
-  if (screenOff) bright = 0;
-  if (bright != appliedBrightness) {
+  static bool panelOff = false;
+  static uint32_t lastApply = 0;
+  if (screenOff) {
+    if (!panelOff) {
+      panel->setBrightness(0);
+      panel->displayOff();
+      panelOff = true;
+      appliedBrightness = 0;
+    }
+    return;
+  }
+  if (panelOff) {
+    panel->displayOn();
+    panelOff = false;
+    appliedBrightness = 0;
+    navDirty = true;
+  }
+  if (bright != appliedBrightness || now - lastApply > 5000) {
     panel->setBrightness(bright);
     appliedBrightness = bright;
+    lastApply = now;
   }
 }
 
