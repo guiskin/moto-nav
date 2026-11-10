@@ -47,7 +47,7 @@
 #define MAP_CHAR_UUID "6e0a0003-7a3b-4c2d-9e1f-0b5a4d3c2b1a"
 #define INFO_CHAR_UUID "6e0a0004-7a3b-4c2d-9e1f-0b5a4d3c2b1a"
 #define OTA_CHAR_UUID "6e0a0005-7a3b-4c2d-9e1f-0b5a4d3c2b1a"
-#define SLEEP_AFTER_MS 10000
+#define SLEEP_AFTER_MS 30000
 
 #define CX (LCD_W / 2)
 #define NAV_TIMEOUT_MS 20000
