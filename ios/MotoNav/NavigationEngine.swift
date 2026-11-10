@@ -147,7 +147,6 @@ final class NavigationEngine: ObservableObject {
         snapshot = NavSnapshot()
         mode = .cruising
         voice.reset()
-        voice.say("Modo passeio")
         trip = TripRecorder(title: "Passeio")
         startSession(origin: loc.coordinate)
         location?.setBackground(true)
@@ -253,7 +252,6 @@ final class NavigationEngine: ObservableObject {
         guard geometry != nil else { return }
         mode = .navigating
         voice.reset()
-        voice.say("Iniciando navegação")
         trip = simulate ? nil : TripRecorder(title: destination?.name ?? "Viagem")
         startSession()
         location?.setBackground(true)
@@ -357,7 +355,7 @@ final class NavigationEngine: ObservableObject {
             s.street = destination?.name ?? "Destino"
         } else if let k = g.nextStepIndex(after: along) {
             let m = g.maneuver(forStep: k)
-            announce(step: k, code: m.code, distance: max(0, g.stepStart[k] - along), instruction: g.instructions[k])
+            announce(step: k, maneuver: m, distance: max(0, g.stepStart[k] - along), loc: loc)
             s.maneuver = m.code
             s.exitNumber = m.exitNumber
             s.angle = m.angle
@@ -377,10 +375,10 @@ final class NavigationEngine: ObservableObject {
             let dist = max(0, c.curve.along - along)
             s.curveDistance = dist
             s.curveAngle = c.curve.angle
-            if dist <= 200 {
+            if dist <= triggerDistance(loc) {
                 let side = c.curve.angle > 0 ? "à direita" : "à esquerda"
-                let sharp = abs(c.curve.angle) >= 90 ? "Curva acentuada" : "Curva"
-                voice.say("\(sharp) \(side)", once: "curve-\(geometryVersion)-\(c.index)")
+                let sharp = abs(c.curve.angle) >= 90 ? "curva fechada" : "curva"
+                voice.say("Em \(shortDistance(dist)), \(sharp) \(side)", once: "curve-\(geometryVersion)-\(c.index)")
             }
         }
         roadAndRadar(loc, &s)
@@ -402,10 +400,8 @@ final class NavigationEngine: ObservableObject {
         s.roadName = info.name
         if let cam = tm.nextCamera(at: (x: p.x, y: p.y), course: course) {
             s.radarDistance = cam.distance
-            if settings?.radarAlerts ?? true, cam.distance <= 400, cam.distance > 30 {
-                let lim = cam.limit ?? info.limit
-                let suffix = lim.map { ", limite \($0)" } ?? ""
-                voice.say("Radar em \(VoiceGuide.spokenDistance(cam.distance))\(suffix)", once: "radar-\(session)-\(cam.key)")
+            if settings?.radarAlerts ?? true, cam.distance <= 200, cam.distance > 30 {
+                voice.say("Radar a \(shortDistance(cam.distance))", once: "radar-\(session)-\(cam.key)")
             }
         }
         if let lim = s.limit, settings?.speedAlerts ?? true, s.speedKmh > Double(lim) + 7 {
@@ -441,14 +437,28 @@ final class NavigationEngine: ObservableObject {
         return "Estou indo de moto para \(dest.name ?? "o destino"). Chego por volta das \(f.string(from: arrival)) (\(Format.duration(snapshot.remainingTime))). \(link)"
     }
 
-    private func announce(step k: Int, code: ManeuverCode, distance: Double, instruction: String) {
-        guard code != .arrive, code != .depart, !instruction.isEmpty else { return }
-        let text = instruction.prefix(1).lowercased() + instruction.dropFirst()
-        if distance <= 300 && distance > 120 {
-            voice.say("Em \(VoiceGuide.spokenDistance(distance)), \(text)", once: "far-\(geometryVersion)-\(k)")
-        } else if distance <= 60 {
-            voice.say(instruction, once: "near-\(geometryVersion)-\(k)")
+    private func triggerDistance(_ loc: CLLocation) -> Double {
+        max(50, max(0, loc.speed) * 4)
+    }
+
+    private func shortDistance(_ m: Double) -> String {
+        let r = max(10, (m / 10).rounded() * 10)
+        return "\(Int(r)) metros"
+    }
+
+    private func announce(step k: Int, maneuver m: Maneuver, distance: Double, loc: CLLocation) {
+        let action: String
+        switch m.code {
+        case .right, .sharpRight: action = "vire à direita"
+        case .left, .sharpLeft: action = "vire à esquerda"
+        case .slightRight, .keepRight: action = "mantenha à direita"
+        case .slightLeft, .keepLeft: action = "mantenha à esquerda"
+        case .uturn: action = "faça o retorno"
+        case .roundabout: action = m.exitNumber > 0 ? "na rotatória, \(m.exitNumber)ª saída" : "entre na rotatória"
+        default: return
         }
+        guard distance <= triggerDistance(loc) else { return }
+        voice.say("Em \(shortDistance(distance)), \(action)", once: "turn-\(geometryVersion)-\(k)")
     }
 
     private func sendAlert() {

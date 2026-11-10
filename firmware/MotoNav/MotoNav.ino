@@ -47,7 +47,7 @@
 #define MAP_CHAR_UUID "6e0a0003-7a3b-4c2d-9e1f-0b5a4d3c2b1a"
 #define INFO_CHAR_UUID "6e0a0004-7a3b-4c2d-9e1f-0b5a4d3c2b1a"
 #define OTA_CHAR_UUID "6e0a0005-7a3b-4c2d-9e1f-0b5a4d3c2b1a"
-#define SLEEP_AFTER_MS 600000
+#define SLEEP_AFTER_MS 10000
 
 #define CX (LCD_W / 2)
 #define NAV_TIMEOUT_MS 20000
@@ -1376,6 +1376,16 @@ void formatMinutes(uint16_t min, char *out, size_t sz) {
   else snprintf(out, sz, "%uh%02u", min / 60, min % 60);
 }
 
+void fillRing(int cx, int cy, int rIn, int rOut, uint16_t c) {
+  for (int dy = -rOut; dy <= rOut; dy++) {
+    int xo = (int)sqrtf((float)(rOut * rOut - dy * dy));
+    int xi = abs(dy) < rIn ? (int)sqrtf((float)(rIn * rIn - dy * dy)) : 0;
+    if (xo <= xi) continue;
+    gfx->drawFastHLine(cx - xo, cy + dy, xo - xi, c);
+    gfx->drawFastHLine(cx + xi, cy + dy, xo - xi, c);
+  }
+}
+
 bool isTurn(uint8_t m) {
   return m != M_NONE && m != M_STRAIGHT && m != M_DEPART;
 }
@@ -1388,7 +1398,7 @@ bool blinkOn() {
 
 void drawAlertRing() {
   if (!approaching || !blinkOn()) return;
-  for (int r = 226; r <= 232; r++) gfx->drawCircle(CX, LCD_H / 2, r, C_ORANGE);
+  fillRing(CX, LCD_H / 2, 225, 233, C_ORANGE);
 }
 
 void drawCurveBadge(int x, int y, int16_t angle, uint16_t dist) {
@@ -1447,17 +1457,67 @@ void drawLimitSign(int x, int y, uint8_t limit, bool over) {
 }
 
 void drawRadarBadge(int x, int y, uint16_t dist) {
-  gfx->fillCircle(x, y, 30, 0x2104);
-  for (int r = 28; r <= 30; r++) gfx->drawCircle(x, y, r, C_ORANGE);
-  gfx->fillRoundRect(x - 14, y - 12, 28, 18, 4, C_ORANGE);
-  gfx->fillCircle(x, y - 3, 6, 0x2104);
-  gfx->fillCircle(x, y - 3, 3, C_ORANGE);
-  gfx->fillRect(x - 4, y + 6, 8, 8, C_ORANGE);
+  bool close = dist <= 200;
+  gfx->fillCircle(x, y, 40, C_RED);
+  gfx->fillCircle(x, y, 33, RGB565_WHITE);
+  gfx->fillRoundRect(x - 18, y - 13, 36, 24, 5, RGB565_BLACK);
+  gfx->fillRect(x - 7, y - 18, 14, 6, RGB565_BLACK);
+  gfx->fillCircle(x, y - 1, 9, RGB565_WHITE);
+  gfx->fillCircle(x, y - 1, 6, RGB565_BLACK);
+  gfx->fillCircle(x + 12, y - 8, 2, RGB565_WHITE);
   char b[16];
   snprintf(b, sizeof(b), "%u m", (unsigned)((dist / 10) * 10));
-  gfx->setFont(u8g2_font_helvB14_tf);
+  gfx->setFont(u8g2_font_helvB18_tf);
   int w = textWidth(b);
-  textAt(b, x - w / 2, y + 50, u8g2_font_helvB14_tf, C_ORANGE);
+  gfx->fillRoundRect(x - w / 2 - 10, y + 44, w + 20, 28, 14, close ? C_RED : 0x2104);
+  textAt(b, x - w / 2, y + 65, u8g2_font_helvB18_tf, RGB565_WHITE);
+}
+
+uint32_t radarFlashStart = 0;
+uint16_t lastRadarDist = 0xFFFF;
+
+void updateRadarFlash(uint32_t now) {
+  StatusData st;
+  uint16_t d = statusFresh(st) ? st.radarDist : 0xFFFF;
+  if (d != 0xFFFF && d <= 200 && (lastRadarDist == 0xFFFF || lastRadarDist > 200 || d > lastRadarDist + 100)) {
+    radarFlashStart = now ? now : 1;
+    lastActivity = now;
+    navDirty = true;
+  }
+  lastRadarDist = d;
+}
+
+bool radarFlashing(uint32_t now) {
+  return radarFlashStart != 0 && now - radarFlashStart < 2200;
+}
+
+void drawRadarFlash(uint32_t now) {
+  StatusData st;
+  bool close = statusFresh(st) && st.radarDist != 0xFFFF && st.radarDist <= 200;
+  if (radarFlashing(now)) {
+    uint16_t c = ((now - radarFlashStart) / 250) % 2 == 0 ? C_RED : RGB565_WHITE;
+    fillRing(CX, LCD_H / 2, 208, 233, c);
+  } else if (close) {
+    fillRing(CX, LCD_H / 2, 224, 233, C_RED);
+  }
+}
+
+void drawBatteryIcon() {
+  int bp = batteryPct;
+  if (bp < 0) return;
+  bool chg = charging;
+  uint16_t col = chg ? C_GREEN : (bp < 15 ? C_RED : (bp < 30 ? C_ORANGE : C_FG));
+  char b[8];
+  snprintf(b, sizeof(b), "%d%%", bp);
+  gfx->setFont(u8g2_font_helvB14_tf);
+  int tw = textWidth(b);
+  int total = 26 + 3 + 5 + tw;
+  int x = CX - total / 2, y = 10;
+  gfx->drawRect(x, y, 26, 13, col);
+  gfx->fillRect(x + 26, y + 4, 3, 5, col);
+  int fill = max(1, min(22, bp * 22 / 100));
+  gfx->fillRect(x + 2, y + 2, fill, 9, col);
+  textAt(b, x + 34, y + 12, u8g2_font_helvB14_tf, col);
 }
 
 void drawStatusBadges(int limitX, int limitY, int radarX, int radarY, float kmh) {
@@ -1566,7 +1626,7 @@ void drawNavScreen(const NavData &n) {
   drawManeuver(n, CX, 220, 1.0f, C_BG);
   AlertData a;
   if (curveActive(a)) drawCurveBadge(CX + 150, 220, a.angle, a.dist);
-  drawStatusBadges(CX - 150, 200, CX - 150, 290, n.speedKmh);
+  drawStatusBadges(CX - 150, 150, CX - 145, 250, n.speedKmh);
   if (n.flags & 0x01) {
     textCentered("Recalculando...", 372, u8g2_font_helvB24_tf, C_ORANGE);
   } else {
@@ -1594,11 +1654,6 @@ void drawIdleScreen(const GpsData &g, bool connected) {
     snprintf(b, sizeof(b), "--:--");
   }
   textCentered(b, 80, u8g2_font_helvB24_tf, C_FG);
-  int bp = batteryPct;
-  if (bp >= 0) {
-    snprintf(b, sizeof(b), charging ? "Bateria %d%% +" : "Bateria %d%%", bp);
-    textCentered(b, 118, u8g2_font_helvB14_tf, bp < 15 && !charging ? C_ORANGE : C_DIM);
-  }
   if (g.fix) snprintf(b, sizeof(b), "%d", (int)roundf(g.kmph));
   else snprintf(b, sizeof(b), "0");
   textCentered(b, 280, u8g2_font_logisoso92_tn, g.fix ? C_FG : C_DIM);
@@ -1721,7 +1776,7 @@ void drawMapOverlay(const NavData &n, float speedKmh) {
   gfx->fillRoundRect(CX - 62, 410, 124, 40, 20, over ? C_RED : C_PANEL);
   snprintf(b, sizeof(b), "%d km/h", (int)roundf(speedKmh));
   textCentered(b, 438, u8g2_font_helvB18_tf, C_FG);
-  drawStatusBadges(CX + 125, 380, CX + 125, 290, speedKmh);
+  drawStatusBadges(CX + 125, 380, CX + 115, 255, speedKmh);
 }
 
 float routePointAt(const RouteData &m, float along, float &x, float &y) {
@@ -2022,7 +2077,12 @@ void loop() {
   portENTER_CRITICAL(&gpsMux);
   g = gpsShared;
   portEXIT_CRITICAL(&gpsMux);
-  if (mode != 0 || otaActive || (g.fix && g.kmph > 5)) lastActivity = now;
+  updateRadarFlash(now);
+  if (mode != 0 || otaActive) lastActivity = now;
+  if (screenOff && now - lastActivity < SLEEP_AFTER_MS) {
+    screenOff = false;
+    navDirty = true;
+  }
   if (!screenOff && now - lastActivity > SLEEP_AFTER_MS) {
     screenOff = true;
     navDirty = true;
@@ -2041,7 +2101,7 @@ void loop() {
   uint8_t scr = list[screenIdx];
   bool animating = mode != 0 && scr == SCR_MAP && mapReady && !otaActive;
 
-  uint32_t interval = animating ? 40 : (approaching ? 100 : (mode != 0 ? 250 : 1000));
+  uint32_t interval = animating ? 40 : ((approaching || radarFlashing(now)) ? 100 : (mode != 0 ? 250 : 1000));
   if (otaActive) interval = 200;
   if (!navDirty && now - lastDraw < interval) {
     delay(5);
@@ -2072,6 +2132,8 @@ void loop() {
     drawWaitingMap(n, msg);
   }
   if (mode == 1) drawAlertRing();
+  if (mode != 0) drawRadarFlash(now);
+  drawBatteryIcon();
   drawToast();
   gfx->flush();
 }
