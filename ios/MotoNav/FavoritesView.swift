@@ -151,8 +151,8 @@ struct AddFavoriteView: View {
                 if let c = location.location?.coordinate { search.setRegion(around: c, meters: 2_000_000) }
                 if let e = editing, coordinate == nil {
                     name = e.name
-                    addressTitle = e.name
-                    addressSub = e.subtitle
+                    addressTitle = e.subtitle.isEmpty ? e.name : e.subtitle
+                    addressSub = ""
                     let c = CLLocationCoordinate2D(latitude: e.latitude, longitude: e.longitude)
                     coordinate = c
                     camera = .region(MKCoordinateRegion(center: c, latitudinalMeters: 400, longitudinalMeters: 400))
