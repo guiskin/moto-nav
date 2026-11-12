@@ -24,7 +24,8 @@ jobs:
           xcodebuild -project MotoNav.xcodeproj -scheme MotoNav -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build | tee build.log | grep -E "error:|warning:|BUILD" || true
-          test -d build/Build/Products/Release-iphoneos/MotoNav.app
+          grep -q "BUILD SUCCEEDED" build.log
+          test -f build/Build/Products/Release-iphoneos/MotoNav.app/MotoNav
       - name: Package IPA
         working-directory: ios
         run: |

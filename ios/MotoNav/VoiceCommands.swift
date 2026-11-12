@@ -30,6 +30,10 @@ struct ImaAdpcm {
     }
 }
 
+final class FinishFlag {
+    var done = false
+}
+
 final class VoiceReceiver {
     private var session: UInt8 = 0
     private var samples: [Int16] = []
@@ -200,6 +204,7 @@ enum VoiceParser {
     }
 }
 
+@MainActor
 final class VoiceCommandCenter: ObservableObject {
     @Published private(set) var lastHeard = ""
     private weak var ble: BLEManager?
@@ -215,7 +220,7 @@ final class VoiceCommandCenter: ObservableObject {
         self.places = places
         self.playlists = playlists
         ble.onVoice = { [weak self] samples, rate in
-            DispatchQueue.main.async { self?.process(samples, rate: rate) }
+            Task { @MainActor in self?.process(samples, rate: rate) }
         }
         SFSpeechRecognizer.requestAuthorization { _ in }
     }
@@ -251,22 +256,25 @@ final class VoiceCommandCenter: ObservableObject {
         req.append(buf)
         req.endAudio()
         task?.cancel()
-        var finished = false
+        let box = FinishFlag()
         task = recognizer.recognitionTask(with: req) { [weak self] result, error in
-            DispatchQueue.main.async {
-                guard let self = self, !finished else { return }
-                if let r = result, r.isFinal {
-                    finished = true
-                    self.handle(r.bestTranscription.formattedString)
-                } else if error != nil {
-                    finished = true
+            let text = result?.isFinal == true ? result?.bestTranscription.formattedString : nil
+            let failed = error != nil
+            Task { @MainActor in
+                guard let self = self, !box.done else { return }
+                if let text = text {
+                    box.done = true
+                    self.handle(text)
+                } else if failed {
+                    box.done = true
                     self.reply(false, "Não consegui entender", speak: false)
                 }
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
-            guard let self = self, !finished else { return }
-            finished = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard let self = self, !box.done else { return }
+            box.done = true
             self.task?.cancel()
             self.reply(false, "Não consegui entender", speak: false)
         }
