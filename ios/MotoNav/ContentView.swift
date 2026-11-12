@@ -160,18 +160,34 @@ struct ContentView: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 
+    @State private var showFavName = false
+    @State private var favName = ""
+
     private var previewPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text(engine.destination?.name ?? "Destino").font(.title3.bold())
                 Spacer()
                 Button {
-                    places.toggleFavorite(engine.destination)
+                    if places.isFavorite(engine.destination) {
+                        places.toggleFavorite(engine.destination)
+                    } else {
+                        favName = engine.destination?.name ?? ""
+                        showFavName = true
+                    }
                 } label: {
                     Image(systemName: places.isFavorite(engine.destination) ? "star.fill" : "star")
                         .font(.title2)
                         .foregroundStyle(.yellow)
                 }
+            }
+            if !places.isFavorite(engine.destination) {
+                HStack {
+                    Button("Salvar como Casa") { places.toggleFavorite(engine.destination, name: "Casa") }
+                    Button("Salvar como Trabalho") { places.toggleFavorite(engine.destination, name: "Trabalho") }
+                }
+                .buttonStyle(.bordered)
+                .font(.footnote)
             }
             if let r = engine.route {
                 Text("\(Format.distance(r.distance)) · \(Format.duration(r.expectedTravelTime))")
@@ -196,6 +212,11 @@ struct ContentView: View {
         }
         .padding()
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .alert("Nome do favorito", isPresented: $showFavName) {
+            TextField("Ex.: Casa, Trabalho", text: $favName)
+            Button("Salvar") { places.toggleFavorite(engine.destination, name: favName) }
+            Button("Cancelar", role: .cancel) {}
+        }
     }
 
     private var navPanel: some View {

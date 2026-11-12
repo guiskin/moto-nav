@@ -2,15 +2,15 @@ import Foundation
 import MapKit
 
 struct SavedPlace: Codable, Identifiable, Equatable {
-    var id: String { "\(name)|\(String(format: "%.5f,%.5f", latitude, longitude))" }
-    let name: String
+    var id: String { String(format: "%.5f,%.5f", latitude, longitude) }
+    var name: String
     let subtitle: String
     let latitude: Double
     let longitude: Double
     var date: Date
 
-    init(item: MKMapItem) {
-        name = item.name ?? "Destino"
+    init(item: MKMapItem, name customName: String? = nil) {
+        name = customName ?? item.name ?? "Destino"
         let pm = item.placemark
         subtitle = [pm.thoroughfare, pm.subThoroughfare, pm.subLocality, pm.locality]
             .compactMap { $0 }
@@ -48,9 +48,10 @@ final class PlacesStore: ObservableObject {
         return favorites.contains(p)
     }
 
-    func toggleFavorite(_ item: MKMapItem?) {
+    func toggleFavorite(_ item: MKMapItem?, name: String? = nil) {
         guard let item = item else { return }
-        let p = SavedPlace(item: item)
+        let clean = name?.trimmingCharacters(in: .whitespaces)
+        let p = SavedPlace(item: item, name: (clean?.isEmpty ?? true) ? nil : clean)
         if let i = favorites.firstIndex(of: p) {
             favorites.remove(at: i)
         } else {
