@@ -248,6 +248,10 @@ final class NavigationEngine: ObservableObject {
         ble.sendPosition(d)
     }
 
+    func speak(_ text: String) {
+        voice.say(text)
+    }
+
     func start(simulate: Bool) {
         guard geometry != nil else { return }
         mode = .navigating

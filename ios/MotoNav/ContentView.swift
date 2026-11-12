@@ -8,6 +8,8 @@ struct ContentView: View {
     @EnvironmentObject var places: PlacesStore
     @EnvironmentObject var settings: SettingsStore
     @EnvironmentObject var trips: TripStore
+    @EnvironmentObject var playlists: PlaylistStore
+    @EnvironmentObject var voiceCenter: VoiceCommandCenter
     @State private var showSettings = false
     @State private var showTrips = false
     @State private var showFavorites = false
@@ -56,6 +58,8 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showSettings) {
             SettingsView()
+                .environmentObject(playlists)
+                .environmentObject(voiceCenter)
                 .environmentObject(settings)
                 .environmentObject(ble)
                 .environmentObject(engine)

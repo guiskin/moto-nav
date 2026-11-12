@@ -4,7 +4,13 @@ struct SettingsView: View {
     @EnvironmentObject var settings: SettingsStore
     @EnvironmentObject var ble: BLEManager
     @EnvironmentObject var engine: NavigationEngine
+    @EnvironmentObject var playlists: PlaylistStore
+    @EnvironmentObject var voiceCenter: VoiceCommandCenter
     @StateObject private var updater = FirmwareUpdater()
+    @State private var showAddPlaylist = false
+    @State private var plName = ""
+    @State private var plLink = ""
+    @State private var plError = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -31,6 +37,30 @@ struct SettingsView: View {
                     Toggle("Avisos por voz", isOn: $engine.voiceEnabled)
                     Toggle("Aviso de velocidade acima do limite", isOn: $settings.speedAlerts)
                     Toggle("Aviso de radar", isOn: $settings.radarAlerts)
+                }
+
+                Section {
+                    ForEach(playlists.items) { p in
+                        VStack(alignment: .leading) {
+                            Text(p.name)
+                            Text(p.uri).font(.caption2).foregroundStyle(.secondary)
+                        }
+                        .swipeActions {
+                            Button("Excluir", role: .destructive) { playlists.remove(p) }
+                        }
+                    }
+                    Button("Adicionar playlist") {
+                        plName = ""
+                        plLink = ""
+                        showAddPlaylist = true
+                    }
+                    if !voiceCenter.lastHeard.isEmpty {
+                        Text("Último comando ouvido: \(voiceCenter.lastHeard)").font(.caption).foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Comando de voz e Spotify")
+                } footer: {
+                    Text("Dê dois cliques no botão BOOT da placa e fale, por exemplo: \"vamos para casa\" ou \"tocar playlist estrada\". Para tocar playlist o app precisa estar aberto na tela.")
                 }
 
                 Section {
@@ -88,6 +118,19 @@ struct SettingsView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("OK") { dismiss() }
                 }
+            }
+            .alert("Nova playlist", isPresented: $showAddPlaylist) {
+                TextField("Nome (ex.: estrada)", text: $plName)
+                TextField("Link da playlist no Spotify", text: $plLink)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                Button("Salvar") { plError = !playlists.add(name: plName, link: plLink) }
+                Button("Cancelar", role: .cancel) {}
+            }
+            .alert("Link inválido", isPresented: $plError) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("No Spotify, toque em Compartilhar → Copiar link da playlist.")
             }
             .task { await updater.check() }
             .onChange(of: settings.dayBrightness) { _, _ in engine.pushSettings() }

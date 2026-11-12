@@ -32,6 +32,7 @@ targets:
         NSLocationWhenInUseUsageDescription: O MotoNav usa sua localização para calcular a rota e acompanhar a navegação.
         NSLocationAlwaysAndWhenInUseUsageDescription: O MotoNav continua acompanhando a rota com a tela bloqueada durante a navegação.
         NSBluetoothAlwaysUsageDescription: O MotoNav usa Bluetooth para enviar as instruções para a tela da moto.
+        NSSpeechRecognitionUsageDescription: O MotoNav entende seus comandos de voz, como ir para um favorito ou tocar uma playlist.
         ITSAppUsesNonExemptEncryption: false
     settings:
       base:

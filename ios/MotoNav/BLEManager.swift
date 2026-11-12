@@ -24,6 +24,10 @@ final class BLEManager: NSObject, ObservableObject {
     private var navChar: CBCharacteristic?
     private var mapChar: CBCharacteristic?
     private var infoChar: CBCharacteristic?
+    private let voiceRx = VoiceReceiver()
+    var onVoice: (([Int16], Int) -> Void)? {
+        didSet { voiceRx.onComplete = onVoice }
+    }
     private var otaChar: CBCharacteristic?
     private var bulkTarget: CBCharacteristic?
     private var otaTimeout: DispatchWorkItem?
@@ -332,6 +336,10 @@ extension BLEManager: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        if characteristic.uuid == Self.infoCharUUID, let v = characteristic.value, VoiceReceiver.isAudio(v) {
+            voiceRx.handle(v)
+            return
+        }
         guard characteristic.uuid == Self.infoCharUUID, let v = characteristic.value,
               let text = String(data: v, encoding: .utf8) else { return }
         handleInfo(text)

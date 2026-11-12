@@ -11,6 +11,7 @@
 #include <BLEUtils.h>
 #include <esp_heap_caps.h>
 #include <Update.h>
+#include <ESP_I2S.h>
 #define XPOWERS_CHIP_AXP2101
 #include "XPowersLib.h"
 #include <host/ble_hs.h>
@@ -1097,6 +1098,265 @@ void musicCommand(uint8_t cmd) {
   ble_gattc_write_flat(connHandle, ios.rcVal, &cmd, 1, nullptr, nullptr);
 }
 
+#define ES7210_ADDR 0x40
+#define MIC_MCLK 42
+#define MIC_BCLK 9
+#define MIC_LRCK 45
+#define MIC_DOUT 8
+#define MIC_DIN 10
+#define VOICE_RATE 16000
+#define VOICE_FRAME 320
+#define VOICE_MAX_SAMPLES (VOICE_RATE * 8)
+#define VOICE_BLOCK 200
+
+I2SClass micI2S;
+volatile bool voiceRequested = false;
+volatile uint32_t voiceAnswerAt = 0;
+bool micReady = false;
+uint8_t voiceSession = 0;
+
+bool es7210Write(uint8_t r, uint8_t v) {
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  Wire.beginTransmission(ES7210_ADDR);
+  Wire.write(r);
+  Wire.write(v);
+  bool ok = Wire.endTransmission() == 0;
+  xSemaphoreGive(i2cMutex);
+  return ok;
+}
+
+int es7210Read(uint8_t r) {
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  Wire.beginTransmission(ES7210_ADDR);
+  Wire.write(r);
+  int v = -1;
+  if (Wire.endTransmission(false) == 0 && Wire.requestFrom((uint8_t)ES7210_ADDR, (uint8_t)1) == 1) v = Wire.read();
+  xSemaphoreGive(i2cMutex);
+  return v;
+}
+
+bool micInit() {
+  if (micReady) return true;
+  if (!micI2S.setPins(MIC_BCLK, MIC_LRCK, MIC_DOUT, MIC_DIN, MIC_MCLK)) return false;
+  if (!micI2S.begin(I2S_MODE_STD, VOICE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) return false;
+  delay(30);
+  bool ok = true;
+  ok &= es7210Write(0x00, 0xFF);
+  ok &= es7210Write(0x00, 0x32);
+  ok &= es7210Write(0x01, 0x3F);
+  ok &= es7210Write(0x09, 0x30);
+  ok &= es7210Write(0x0A, 0x30);
+  ok &= es7210Write(0x23, 0x2A);
+  ok &= es7210Write(0x22, 0x0A);
+  ok &= es7210Write(0x20, 0x0A);
+  ok &= es7210Write(0x21, 0x2A);
+  int m = es7210Read(0x08);
+  ok &= es7210Write(0x08, m < 0 ? 0x10 : (m & ~0x01));
+  ok &= es7210Write(0x40, 0xC3);
+  ok &= es7210Write(0x41, 0x70);
+  ok &= es7210Write(0x42, 0x70);
+  ok &= es7210Write(0x11, 0x60);
+  ok &= es7210Write(0x12, 0x00);
+  ok &= es7210Write(0x02, 0xC1);
+  ok &= es7210Write(0x07, 0x20);
+  ok &= es7210Write(0x04, 0x01);
+  ok &= es7210Write(0x05, 0x00);
+  ok &= es7210Write(0x43, 0x1A);
+  ok &= es7210Write(0x44, 0x1A);
+  ok &= es7210Write(0x45, 0x1A);
+  ok &= es7210Write(0x46, 0x1A);
+  ok &= es7210Write(0x47, 0x08);
+  ok &= es7210Write(0x48, 0x08);
+  ok &= es7210Write(0x49, 0x08);
+  ok &= es7210Write(0x4A, 0x08);
+  ok &= es7210Write(0x06, 0x04);
+  ok &= es7210Write(0x01, 0x00);
+  ok &= es7210Write(0x4B, 0x00);
+  ok &= es7210Write(0x4C, 0x00);
+  ok &= es7210Write(0x00, 0x71);
+  ok &= es7210Write(0x00, 0x41);
+  Serial.printf("es7210 id=%02X%02X ok=%d\n", es7210Read(0xFD), es7210Read(0xFE), ok);
+  micReady = ok;
+  return ok;
+}
+
+const int8_t imaIdx[16] = {-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8};
+const int16_t imaStep[89] = {7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767};
+
+uint8_t imaEncode(int16_t sample, int &pred, int &idx) {
+  int step = imaStep[idx];
+  int diff = sample - pred;
+  uint8_t code = 0;
+  if (diff < 0) {
+    code = 8;
+    diff = -diff;
+  }
+  int vp = step >> 3;
+  if (diff >= step) {
+    code |= 4;
+    diff -= step;
+    vp += step;
+  }
+  step >>= 1;
+  if (diff >= step) {
+    code |= 2;
+    diff -= step;
+    vp += step;
+  }
+  step >>= 1;
+  if (diff >= step) {
+    code |= 1;
+    vp += step;
+  }
+  pred += (code & 8) ? -vp : vp;
+  if (pred > 32767) pred = 32767;
+  if (pred < -32768) pred = -32768;
+  idx += imaIdx[code];
+  if (idx < 0) idx = 0;
+  if (idx > 88) idx = 88;
+  return code;
+}
+
+void setVoiceToast(const char *title, const char *msg, uint32_t ms) {
+  Toast t = {};
+  t.active = true;
+  strncpy(t.app, "Voz", sizeof(t.app) - 1);
+  strncpy(t.title, title, sizeof(t.title) - 1);
+  strncpy(t.msg, msg, sizeof(t.msg) - 1);
+  t.until = millis() + ms;
+  portENTER_CRITICAL(&toastMux);
+  toastShared = t;
+  portEXIT_CRITICAL(&toastMux);
+  lastActivity = millis();
+  screenOff = false;
+  navDirty = true;
+}
+
+void audioNotify(const uint8_t *d, size_t n) {
+  if (!infoChar || !bleConnected) return;
+  infoChar->setValue((uint8_t *)d, n);
+  infoChar->notify();
+}
+
+void voiceSend(const int16_t *pcm, size_t total) {
+  uint16_t blocks = (total + VOICE_BLOCK - 1) / VOICE_BLOCK;
+  voiceSession++;
+  uint8_t head[8] = {0xB0, voiceSession, (uint8_t)(VOICE_RATE & 255), (uint8_t)(VOICE_RATE >> 8), (uint8_t)(blocks & 255), (uint8_t)(blocks >> 8)};
+  audioNotify(head, 6);
+  vTaskDelay(pdMS_TO_TICKS(30));
+  int pred = 0, idx = 0;
+  uint8_t pk[7 + VOICE_BLOCK / 2];
+  for (uint16_t b = 0; b < blocks; b++) {
+    pk[0] = 0xB1;
+    pk[1] = voiceSession;
+    pk[2] = b & 255;
+    pk[3] = b >> 8;
+    pk[4] = (uint8_t)(pred & 255);
+    pk[5] = (uint8_t)((pred >> 8) & 255);
+    pk[6] = idx;
+    for (int i = 0; i < VOICE_BLOCK; i += 2) {
+      size_t i0 = (size_t)b * VOICE_BLOCK + i;
+      int16_t a = i0 < total ? pcm[i0] : 0;
+      int16_t c = i0 + 1 < total ? pcm[i0 + 1] : 0;
+      uint8_t lo = imaEncode(a, pred, idx);
+      uint8_t hi = imaEncode(c, pred, idx);
+      pk[7 + i / 2] = lo | (hi << 4);
+    }
+    audioNotify(pk, sizeof(pk));
+    vTaskDelay(pdMS_TO_TICKS(9));
+  }
+  uint8_t tail[4] = {0xB2, voiceSession, (uint8_t)(blocks & 255), (uint8_t)(blocks >> 8)};
+  vTaskDelay(pdMS_TO_TICKS(30));
+  audioNotify(tail, 4);
+  vTaskDelay(pdMS_TO_TICKS(30));
+  char info[32];
+  snprintf(info, sizeof(info), "fw=%d", FW_VERSION);
+  infoChar->setValue((uint8_t *)info, strlen(info));
+}
+
+void voiceTask(void *) {
+  int16_t *buf = (int16_t *)heap_caps_malloc(VOICE_MAX_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+  int16_t *stereo = (int16_t *)heap_caps_malloc(VOICE_FRAME * 2 * sizeof(int16_t), MALLOC_CAP_INTERNAL);
+  for (;;) {
+    if (!voiceRequested) {
+      if (voiceAnswerAt && millis() - voiceAnswerAt > 9000) {
+        voiceAnswerAt = 0;
+        setVoiceToast("Sem resposta", "O app não respondeu", 4000);
+      }
+      vTaskDelay(pdMS_TO_TICKS(40));
+      continue;
+    }
+    voiceRequested = false;
+    if (!buf || !stereo || otaActive) continue;
+    if (!bleConnected) {
+      setVoiceToast("Sem conexão", "iPhone desconectado", 3000);
+      continue;
+    }
+    setVoiceToast("Preparando microfone", "", 4000);
+    if (!micInit()) {
+      setVoiceToast("Microfone indisponível", "Falha ao iniciar", 4000);
+      continue;
+    }
+    micI2S.readBytes((char *)stereo, VOICE_FRAME * 4);
+    setVoiceToast("Ouvindo...", "Fale agora", 12000);
+    size_t total = 0;
+    int frames = 0, quiet = 0;
+    bool speech = false;
+    float floorRms = 0, peak = 0;
+    while (total + VOICE_FRAME <= VOICE_MAX_SAMPLES) {
+      size_t got = micI2S.readBytes((char *)stereo, VOICE_FRAME * 4);
+      if (got < VOICE_FRAME * 4) break;
+      double e = 0;
+      for (int i = 0; i < VOICE_FRAME; i++) {
+        int v = stereo[2 * i] + stereo[2 * i + 1];
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        buf[total + i] = v;
+        e += (double)v * v;
+      }
+      float rms = sqrt(e / VOICE_FRAME);
+      if (rms > peak) peak = rms;
+      frames++;
+      total += VOICE_FRAME;
+      if (frames >= 10 && frames < 20) floorRms = max(floorRms, rms);
+      if (frames >= 20) {
+        float thr = max(700.0f, floorRms * 2.5f);
+        if (rms > thr) {
+          speech = true;
+          quiet = 0;
+        } else if (speech) {
+          quiet++;
+        }
+        if (speech && quiet >= 45) break;
+        if (!speech && total > (size_t)VOICE_RATE * 5) break;
+      }
+    }
+    Serial.printf("voice: samples=%u speech=%d floor=%.0f peak=%.0f\n", (unsigned)total, speech, floorRms, peak);
+    if (!speech) {
+      char m[48];
+      snprintf(m, sizeof(m), "Nível %d", (int)peak);
+      setVoiceToast("Não ouvi nada", m, 3500);
+      continue;
+    }
+    size_t trim = (size_t)quiet > 20 ? (quiet - 20) * VOICE_FRAME : 0;
+    size_t sendN = total > trim ? total - trim : total;
+    setVoiceToast("Enviando...", "", 10000);
+    voiceSend(buf, sendN);
+    setVoiceToast("Entendendo...", "", 12000);
+    voiceAnswerAt = millis();
+  }
+}
+
+void handleVoiceResult(const uint8_t *p, size_t n) {
+  if (n < 2) return;
+  char t[96];
+  size_t l = min<size_t>(n - 2, sizeof(t) - 1);
+  memcpy(t, p + 2, l);
+  t[l] = 0;
+  voiceAnswerAt = 0;
+  setVoiceToast(p[1] == 1 ? "Ok" : "Não entendi", t, 5000);
+}
+
 void rxTask(void *) {
   RxItem it;
   for (;;) {
@@ -1108,6 +1368,7 @@ void rxTask(void *) {
       case 0x03: handleAlertPacket(it.data, it.len); break;
       case 0x04: handleStatusPacket(it.data, it.len); break;
       case 0x05: handleSettingsPacket(it.data, it.len); break;
+      case 0x06: handleVoiceResult(it.data, it.len); break;
       case 0x20:
       case 0x21:
       case 0x22: handleOtaPacket(it.data, it.len); break;
@@ -1948,6 +2209,7 @@ void setup() {
   lastActivity = millis();
   xTaskCreatePinnedToCore(rxTask, "rx", 8192, nullptr, 3, nullptr, 0);
   xTaskCreatePinnedToCore(gpsTask, "gps", 8192, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(voiceTask, "voice", 8192, nullptr, 2, nullptr, 0);
   bleInit();
   xTaskCreatePinnedToCore(iosTask, "ios", 6144, nullptr, 2, nullptr, 0);
 }
@@ -1956,12 +2218,23 @@ Tap readInput(uint32_t now) {
   static uint32_t lastTap = 0;
   static bool lastBtn = true;
   Tap t = {};
+  static uint32_t pendingBtn = 0;
   bool btn = digitalRead(BOOT_BTN);
   if (lastBtn && !btn) {
+    if (pendingBtn && now - pendingBtn < 450) {
+      pendingBtn = 0;
+      voiceRequested = true;
+      lastActivity = now;
+    } else {
+      pendingBtn = now ? now : 1;
+    }
+  }
+  lastBtn = btn;
+  if (pendingBtn && now - pendingBtn >= 450) {
+    pendingBtn = 0;
     t.tapped = true;
     t.button = true;
   }
-  lastBtn = btn;
   if (touchPending) {
     touchPending = false;
     if (touchOk) {
