@@ -187,10 +187,20 @@ struct RouteGeometry {
         var segment: Int
     }
 
-    func project(_ p: CLLocationCoordinate2D, near hint: Int?) -> Projection? {
+    func segmentIndex(at along: Double) -> Int {
+        var lo = 0, hi = max(0, coords.count - 2)
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if cum[mid] <= along { lo = mid } else { hi = mid - 1 }
+        }
+        return lo
+    }
+
+    func project(_ p: CLLocationCoordinate2D, near hint: Int?, course: Double? = nil) -> Projection? {
         guard coords.count > 1 else { return nil }
         let n = coords.count - 1
         var best: Projection?
+        var bestScore = Double.infinity
         func scan(_ range: ClosedRange<Int>) {
             let k = cos(p.latitude * .pi / 180) * 111_320.0
             for i in range {
@@ -203,7 +213,16 @@ struct RouteGeometry {
                 t = min(max(t, 0), 1)
                 let cx = ax + dx * t, cy = ay + dy * t
                 let dist = sqrt(cx * cx + cy * cy)
-                if best == nil || dist < best!.offRoute {
+                var score = dist
+                if let c = course, len2 > 25 {
+                    var brg = atan2(dx, dy) * 180 / .pi
+                    if brg < 0 { brg += 360 }
+                    var diff = abs(brg - c).truncatingRemainder(dividingBy: 360)
+                    if diff > 180 { diff = 360 - diff }
+                    if diff > 100 { score += 40 }
+                }
+                if best == nil || score < bestScore {
+                    bestScore = score
                     best = Projection(along: cum[i] + (cum[i + 1] - cum[i]) * t, offRoute: dist, segment: i)
                 }
             }
@@ -214,6 +233,7 @@ struct RouteGeometry {
             if let b = best, b.offRoute < 40 { return b }
         }
         best = nil
+        bestScore = .infinity
         scan(0...(n - 1))
         return best
     }

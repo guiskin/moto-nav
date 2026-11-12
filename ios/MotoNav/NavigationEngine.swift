@@ -47,6 +47,8 @@ final class NavigationEngine: ObservableObject {
     private weak var location: LocationProvider?
     private weak var ble: BLEManager?
     private var segmentHint: Int?
+    private var lastAlong = 0.0
+    private var lastAlongVersion = -1
     private var offRouteCount = 0
     private var lastReroute = Date.distantPast
     private var simTimer: Timer?
@@ -221,14 +223,15 @@ final class NavigationEngine: ObservableObject {
 
     private func resendPosition() {
         guard isActive, let loc = lastFix else { return }
-        sendPosition(loc, projection: geometry?.project(loc.coordinate, near: segmentHint), geometry: geometry)
+        let c: Double? = (loc.course >= 0 && loc.speed > 3) ? loc.course : nil
+        sendPosition(loc, projection: geometry?.project(loc.coordinate, near: segmentHint, course: c), geometry: geometry)
     }
 
     private func sendPosition(_ loc: CLLocation, projection proj: RouteGeometry.Projection?, geometry g: RouteGeometry?) {
         guard let ble = ble, let local = projection else { return }
         let p = local.project(loc.coordinate)
         var along: Int32 = -1
-        if let g = g, let proj = proj, let rb = routeBlob, routeOnBoardVersion == geometryVersion, routeBlobVersion == geometryVersion, proj.offRoute < 30 {
+        if let g = g, let proj = proj, let rb = routeBlob, routeOnBoardVersion == geometryVersion, routeBlobVersion == geometryVersion, proj.offRoute < min(120, max(60, loc.horizontalAccuracy * 2)) {
             let i = proj.segment
             let cum = rb.localCum
             if i + 1 < cum.count && i + 1 < g.cum.count {
@@ -332,15 +335,31 @@ final class NavigationEngine: ObservableObject {
             return
         }
         guard let g = geometry else { return }
-        guard let proj = g.project(loc.coordinate, near: segmentHint) else { return }
+        let course: Double? = (loc.course >= 0 && loc.speed > 3) ? loc.course : nil
+        guard var proj = g.project(loc.coordinate, near: segmentHint, course: course) else { return }
 
-        if proj.offRoute > 45 && loc.horizontalAccuracy < 40 && !simulated {
+        if lastAlongVersion != geometryVersion {
+            lastAlongVersion = geometryVersion
+            lastAlong = 0
+        }
+        let snapLimit = min(120, max(60, loc.horizontalAccuracy * 2))
+        if proj.offRoute < snapLimit {
+            if proj.along < lastAlong - 8 && !simulated {
+                proj.along = lastAlong
+                proj.segment = g.segmentIndex(at: lastAlong)
+            } else {
+                lastAlong = max(lastAlong, proj.along)
+            }
+        }
+
+        let offLimit = max(70, loc.horizontalAccuracy * 2.5)
+        if proj.offRoute > offLimit && loc.horizontalAccuracy < 50 && loc.speed > 2 && !simulated {
             offRouteCount += 1
         } else {
             offRouteCount = 0
             segmentHint = proj.segment
         }
-        if offRouteCount >= 3 {
+        if offRouteCount >= 5 {
             reroute(from: loc)
         }
 
