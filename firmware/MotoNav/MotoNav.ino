@@ -1137,7 +1137,7 @@ int es7210Read(uint8_t r) {
 
 bool micInit() {
   if (micReady) return true;
-  if (!micI2S.setPins(MIC_BCLK, MIC_LRCK, MIC_DOUT, MIC_DIN, MIC_MCLK)) return false;
+  micI2S.setPins(MIC_BCLK, MIC_LRCK, MIC_DOUT, MIC_DIN, MIC_MCLK);
   if (!micI2S.begin(I2S_MODE_STD, VOICE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) return false;
   delay(30);
   bool ok = true;
