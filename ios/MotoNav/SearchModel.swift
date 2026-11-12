@@ -15,8 +15,14 @@ final class SearchModel: NSObject, ObservableObject, MKLocalSearchCompleterDeleg
         completer.resultTypes = [.address, .pointOfInterest]
     }
 
-    func setRegion(around coordinate: CLLocationCoordinate2D) {
-        completer.region = MKCoordinateRegion(center: coordinate, latitudinalMeters: 50_000, longitudinalMeters: 50_000)
+    func setRegion(around coordinate: CLLocationCoordinate2D, meters: Double = 50_000) {
+        completer.region = MKCoordinateRegion(center: coordinate, latitudinalMeters: meters, longitudinalMeters: meters)
+    }
+
+    func setQueryQuietly(_ text: String) {
+        completer.delegate = nil
+        query = text
+        completer.delegate = self
     }
 
     func resolve(_ completion: MKLocalSearchCompletion) async -> MKMapItem? {

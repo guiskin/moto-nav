@@ -10,6 +10,7 @@ struct ContentView: View {
     @EnvironmentObject var trips: TripStore
     @State private var showSettings = false
     @State private var showTrips = false
+    @State private var showFavorites = false
     @StateObject private var search = SearchModel()
     @State private var camera: MapCameraPosition = .userLocation(fallback: .automatic)
     @FocusState private var searchFocused: Bool
@@ -36,6 +37,7 @@ struct ContentView: View {
                     statusPill
                     Spacer()
                     if !engine.isActive {
+                        circleButton("star.fill") { showFavorites = true }
                         circleButton("list.bullet") { showTrips = true }
                     }
                     circleButton("gearshape.fill") { showSettings = true }
@@ -57,6 +59,14 @@ struct ContentView: View {
                 .environmentObject(settings)
                 .environmentObject(ble)
                 .environmentObject(engine)
+        }
+        .sheet(isPresented: $showFavorites) {
+            FavoritesView { item in
+                showFavorites = false
+                go(to: item)
+            }
+            .environmentObject(places)
+            .environmentObject(location)
         }
         .sheet(isPresented: $showTrips) {
             TripsView().environmentObject(trips)
@@ -180,14 +190,6 @@ struct ContentView: View {
                         .font(.title2)
                         .foregroundStyle(.yellow)
                 }
-            }
-            if !places.isFavorite(engine.destination) {
-                HStack {
-                    Button("Salvar como Casa") { places.toggleFavorite(engine.destination, name: "Casa") }
-                    Button("Salvar como Trabalho") { places.toggleFavorite(engine.destination, name: "Trabalho") }
-                }
-                .buttonStyle(.bordered)
-                .font(.footnote)
             }
             if let r = engine.route {
                 Text("\(Format.distance(r.distance)) · \(Format.duration(r.expectedTravelTime))")
