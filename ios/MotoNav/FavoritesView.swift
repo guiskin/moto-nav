@@ -6,8 +6,7 @@ struct FavoritesView: View {
     @Environment(\.dismiss) private var dismiss
     let onSelect: (MKMapItem) -> Void
     @State private var showAdd = false
-    @State private var renaming: SavedPlace?
-    @State private var newName = ""
+    @State private var editing: SavedPlace?
 
     var body: some View {
         NavigationStack {
@@ -33,7 +32,7 @@ struct FavoritesView: View {
                             }
                             .swipeActions {
                                 Button("Excluir", role: .destructive) { places.removeFavorite(p) }
-                                Button("Renomear") { newName = p.name; renaming = p }.tint(.blue)
+                                Button("Editar") { editing = p }.tint(.blue)
                             }
                         }
                     }
@@ -50,24 +49,27 @@ struct FavoritesView: View {
                 }
             }
             .sheet(isPresented: $showAdd) {
-                AddFavoriteView().environmentObject(places)
+                AddFavoriteView(editing: nil).environmentObject(places)
             }
-            .alert("Renomear favorito", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
-                TextField("Nome", text: $newName)
-                Button("Salvar") { if let r = renaming { places.renameFavorite(r, to: newName) }; renaming = nil }
-                Button("Cancelar", role: .cancel) { renaming = nil }
+            .sheet(item: $editing) { p in
+                AddFavoriteView(editing: p).environmentObject(places)
             }
         }
     }
 }
 
 struct AddFavoriteView: View {
+    let editing: SavedPlace?
     @EnvironmentObject var places: PlacesStore
     @EnvironmentObject var location: LocationProvider
     @Environment(\.dismiss) private var dismiss
     @StateObject private var search = SearchModel()
     @State private var name = ""
-    @State private var picked: MKMapItem?
+    @State private var addressTitle = ""
+    @State private var addressSub = ""
+    @State private var coordinate: CLLocationCoordinate2D?
+    @State private var noNumber = false
+    @State private var camera: MapCameraPosition = .automatic
     @State private var resolving = false
     @State private var failed = false
     @State private var pickedText = ""
@@ -79,18 +81,12 @@ struct AddFavoriteView: View {
                 Section("Nome do favorito") {
                     TextField("Ex.: Casa, Casa de praia, Academia", text: $name)
                 }
-                Section("Endereço") {
+                Section(coordinate == nil ? "Endereço" : "Buscar outro endereço") {
                     TextField("Rua, número e cidade", text: $search.query)
                         .focused($addressFocused)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                        .onChange(of: search.query) { _, v in
-                            if v != pickedText {
-                                picked = nil
-                                failed = false
-                            }
-                        }
-                    if picked == nil {
+                    if search.query != pickedText {
                         ForEach(Array(search.results.prefix(6).enumerated()), id: \.offset) { _, c in
                             Button {
                                 choose(c)
@@ -107,34 +103,44 @@ struct AddFavoriteView: View {
                         if failed { Text("Não foi possível localizar esse endereço.").font(.caption).foregroundStyle(.red) }
                     }
                 }
-                if let item = picked {
+                if coordinate != nil {
                     Section("Confirme o endereço") {
-                        let pm = item.placemark
                         VStack(alignment: .leading, spacing: 4) {
-                            Text([pm.thoroughfare, pm.subThoroughfare].compactMap { $0 }.joined(separator: ", ")
-                                 .ifEmpty(item.name ?? "Endereço")).font(.headline)
-                            Text([pm.subLocality, pm.locality, pm.administrativeArea].compactMap { $0 }.joined(separator: " - "))
-                            if let cep = pm.postalCode { Text("CEP \(cep)").foregroundStyle(.secondary) }
-                            if pm.subThoroughfare == nil {
+                            Text(addressTitle).font(.headline)
+                            if !addressSub.isEmpty { Text(addressSub) }
+                            if noNumber {
                                 Text("Este resultado não tem número. Digite o número na busca, se quiser o ponto exato.")
                                     .font(.caption).foregroundStyle(.orange)
                             }
                         }
-                        Map(initialPosition: .region(MKCoordinateRegion(center: pm.coordinate, latitudinalMeters: 500, longitudinalMeters: 500))) {
-                            Marker(name.isEmpty ? "Destino" : name, coordinate: pm.coordinate)
+                        ZStack {
+                            Map(position: $camera, interactionModes: [.pan, .zoom]) {}
+                                .onMapCameraChange(frequency: .onEnd) { ctx in
+                                    coordinate = ctx.region.center
+                                }
+                            Image(systemName: "mappin")
+                                .font(.system(size: 34))
+                                .foregroundStyle(.red)
+                                .offset(y: -17)
+                                .allowsHitTesting(false)
                         }
-                        .frame(height: 200)
+                        .frame(height: 280)
                         .clipShape(RoundedRectangle(cornerRadius: 10))
-                        .allowsHitTesting(false)
-                        Button("Confirmar e salvar") {
-                            places.addFavorite(item, name: name.isEmpty ? (item.name ?? "Favorito") : name)
-                            dismiss()
+                        Text("Arraste o mapa para deixar o pino no ponto certo.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Section {
+                        Button(editing == nil ? "Confirmar e salvar" : "Salvar alterações") {
+                            if let c = coordinate {
+                                places.saveFavorite(replacing: editing, name: name, subtitle: addressSub.isEmpty ? addressTitle : "\(addressTitle) - \(addressSub)", coordinate: c)
+                                dismiss()
+                            }
                         }
                         .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
                     }
                 }
             }
-            .navigationTitle("Novo favorito")
+            .navigationTitle(editing == nil ? "Novo favorito" : "Editar favorito")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -143,6 +149,14 @@ struct AddFavoriteView: View {
             }
             .onAppear {
                 if let c = location.location?.coordinate { search.setRegion(around: c, meters: 2_000_000) }
+                if let e = editing, coordinate == nil {
+                    name = e.name
+                    addressTitle = e.name
+                    addressSub = e.subtitle
+                    let c = CLLocationCoordinate2D(latitude: e.latitude, longitude: e.longitude)
+                    coordinate = c
+                    camera = .region(MKCoordinateRegion(center: c, latitudinalMeters: 400, longitudinalMeters: 400))
+                }
             }
         }
     }
@@ -154,18 +168,18 @@ struct AddFavoriteView: View {
         Task {
             let item = await search.resolve(c)
             resolving = false
-            if let item = item {
-                let text = [c.title, c.subtitle].filter { !$0.isEmpty }.joined(separator: ", ")
-                pickedText = text
-                picked = item
-                search.setQueryQuietly(text)
-            } else {
-                failed = true
-            }
+            guard let item = item else { failed = true; return }
+            let pm = item.placemark
+            let street = [pm.thoroughfare, pm.subThoroughfare].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: ", ")
+            addressTitle = street.isEmpty ? (item.name ?? c.title) : street
+            addressSub = [pm.subLocality, pm.locality, pm.administrativeArea, pm.postalCode.map { "CEP \($0)" }]
+                .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " - ")
+            noNumber = pm.subThoroughfare == nil
+            coordinate = pm.coordinate
+            camera = .region(MKCoordinateRegion(center: pm.coordinate, latitudinalMeters: 400, longitudinalMeters: 400))
+            let text = [c.title, c.subtitle].filter { !$0.isEmpty }.joined(separator: ", ")
+            pickedText = text
+            search.setQueryQuietly(text)
         }
     }
-}
-
-private extension String {
-    func ifEmpty(_ other: String) -> String { isEmpty ? other : self }
 }

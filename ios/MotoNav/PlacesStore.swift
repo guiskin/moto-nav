@@ -4,10 +4,18 @@ import MapKit
 struct SavedPlace: Codable, Identifiable, Equatable {
     var id: String { String(format: "%.5f,%.5f", latitude, longitude) }
     var name: String
-    let subtitle: String
-    let latitude: Double
-    let longitude: Double
+    var subtitle: String
+    var latitude: Double
+    var longitude: Double
     var date: Date
+
+    init(name: String, subtitle: String, coordinate: CLLocationCoordinate2D) {
+        self.name = name
+        self.subtitle = subtitle
+        latitude = coordinate.latitude
+        longitude = coordinate.longitude
+        date = Date()
+    }
 
     init(item: MKMapItem, name customName: String? = nil) {
         name = customName ?? item.name ?? "Destino"
@@ -65,6 +73,19 @@ final class PlacesStore: ObservableObject {
         let p = SavedPlace(item: item, name: clean.isEmpty ? nil : clean)
         favorites.removeAll { $0 == p }
         favorites.insert(p, at: 0)
+        save(favorites, favKey)
+    }
+
+    func saveFavorite(replacing old: SavedPlace?, name: String, subtitle: String, coordinate: CLLocationCoordinate2D) {
+        let clean = name.trimmingCharacters(in: .whitespaces)
+        guard !clean.isEmpty else { return }
+        let p = SavedPlace(name: clean, subtitle: subtitle, coordinate: coordinate)
+        if let old = old, let i = favorites.firstIndex(where: { $0.id == old.id }) {
+            favorites[i] = p
+        } else {
+            favorites.removeAll { $0 == p }
+            favorites.insert(p, at: 0)
+        }
         save(favorites, favKey)
     }
 
