@@ -504,6 +504,7 @@ void clearWorldLocked() {
 struct Camera {
   bool init;
   float x, y, along, heading, mpp;
+  bool hasAlong;
   uint32_t lastMs;
 } cam = {};
 
@@ -2064,6 +2065,36 @@ float routeBearingAt(const RouteData &m, float along) {
   return atan2f(x1 - x0, y1 - y0) * RAD_TO_DEG;
 }
 
+bool projectOnRoute(const RouteData &m, float px, float py, float from, float to, float &outAlong, float &outDist) {
+  if (m.n < 2) return false;
+  float total = m.rcum[m.n - 1];
+  float a0 = constrain(from, 0.0f, total), a1 = constrain(to, 0.0f, total);
+  uint32_t lo = 0, hi = m.n - 1;
+  while (hi - lo > 1) {
+    uint32_t mid = (lo + hi) / 2;
+    if (m.rcum[mid] <= a0) lo = mid;
+    else hi = mid;
+  }
+  float best = 1e9f, bestAlong = 0;
+  for (uint32_t i = lo; i + 1 < m.n && m.rcum[i] <= a1; i++) {
+    float ax = m.rx[i], ay = m.ry[i];
+    float dx = m.rx[i + 1] - ax, dy = m.ry[i + 1] - ay;
+    float len2 = dx * dx + dy * dy;
+    float t = len2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0;
+    t = constrain(t, 0.0f, 1.0f);
+    float cx = ax + dx * t - px, cy = ay + dy * t - py;
+    float d = sqrtf(cx * cx + cy * cy);
+    if (d < best) {
+      best = d;
+      bestAlong = m.rcum[i] + (m.rcum[i + 1] - m.rcum[i]) * t;
+    }
+  }
+  if (best > 1e8f) return false;
+  outAlong = bestAlong;
+  outDist = best;
+  return true;
+}
+
 float wrap180(float a) {
   while (a > 180) a -= 360;
   while (a < -180) a += 360;
@@ -2076,14 +2107,21 @@ void updateCamera(const RouteData &m, const PosTarget &t, uint32_t now) {
   cam.lastMs = now;
   float age = constrain((now - t.ms) / 1000.0f, 0.0f, 3.0f);
   float targetHeading = cam.heading;
-  bool onRoute = t.along >= 0 && m.n >= 2;
+  float tAlong = t.along;
+  if (tAlong < 0 && m.n >= 2 && cam.init && cam.hasAlong) {
+    float a, d;
+    if (projectOnRoute(m, t.x, t.y, cam.along - 120, cam.along + 400, a, d) && d < 90.0f) tAlong = a;
+  }
+  bool onRoute = tAlong >= 0 && m.n >= 2;
+  cam.hasAlong = onRoute;
   if (onRoute) {
-    float predicted = t.along + t.speed * age;
+    float predicted = tAlong + t.speed * age;
     if (!cam.init || fabsf(predicted - cam.along) > 80) {
       cam.along = predicted;
     } else {
       cam.along += t.speed * dt;
-      cam.along += (predicted - cam.along) * min(1.0f, dt * 2.0f);
+      float err = predicted - cam.along;
+      cam.along += err * min(1.0f, dt * (err < -5.0f ? 0.8f : 2.0f));
     }
     routePointAt(m, cam.along, cam.x, cam.y);
     targetHeading = routeBearingAt(m, cam.along);
