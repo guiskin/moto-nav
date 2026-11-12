@@ -1479,7 +1479,7 @@ uint16_t lastRadarDist = 0xFFFF;
 void updateRadarFlash(uint32_t now) {
   StatusData st;
   uint16_t d = statusFresh(st) ? st.radarDist : 0xFFFF;
-  if (d != 0xFFFF && d <= 200 && (lastRadarDist == 0xFFFF || lastRadarDist > 200 || d > lastRadarDist + 100)) {
+  if (d != 0xFFFF && (lastRadarDist == 0xFFFF || d > lastRadarDist + 150)) {
     radarFlashStart = now ? now : 1;
     lastActivity = now;
     navDirty = true;
@@ -1493,7 +1493,7 @@ bool radarFlashing(uint32_t now) {
 
 void drawRadarFlash(uint32_t now) {
   StatusData st;
-  bool close = statusFresh(st) && st.radarDist != 0xFFFF && st.radarDist <= 200;
+  bool close = statusFresh(st) && st.radarDist != 0xFFFF;
   if (radarFlashing(now)) {
     uint16_t c = ((now - radarFlashStart) / 250) % 2 == 0 ? C_RED : RGB565_WHITE;
     fillRing(CX, LCD_H / 2, 208, 233, c);
@@ -1524,7 +1524,7 @@ void drawStatusBadges(int limitX, int limitY, int radarX, int radarY, float kmh)
   StatusData st;
   if (!statusFresh(st)) return;
   if (st.limit > 0) drawLimitSign(limitX, limitY, st.limit, kmh > st.limit + 3);
-  if (st.radarDist != 0xFFFF && st.radarDist <= 500) drawRadarBadge(radarX, radarY, st.radarDist);
+  if (st.radarDist != 0xFFFF) drawRadarBadge(radarX, radarY, st.radarDist);
 }
 
 void drawToast() {

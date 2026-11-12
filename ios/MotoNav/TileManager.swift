@@ -125,7 +125,7 @@ final class TileManager {
         for f in nearbyFeatures(p) {
             for cam in f.cameras {
                 let d = hypot(cam.x - p.x, cam.y - p.y)
-                guard d <= 600 else { continue }
+                guard d <= 700 else { continue }
                 if let c = course {
                     let b = atan2(cam.x - p.x, cam.y - p.y) * 180 / .pi
                     guard d < 25 || Self.angleDiff(b, c) < 30 else { continue }

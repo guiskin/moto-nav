@@ -399,9 +399,12 @@ final class NavigationEngine: ObservableObject {
         s.limit = info.limit
         s.roadName = info.name
         if let cam = tm.nextCamera(at: (x: p.x, y: p.y), course: course) {
-            s.radarDistance = cam.distance
-            if settings?.radarAlerts ?? true, cam.distance <= 200, cam.distance > 30 {
-                voice.say("Radar a \(shortDistance(cam.distance))", once: "radar-\(session)-\(cam.key)")
+            let alertDist = max(300, min(600, loc.speed * 12))
+            if cam.distance <= alertDist {
+                s.radarDistance = cam.distance
+                if settings?.radarAlerts ?? true, cam.distance > 30 {
+                    voice.say("Radar à frente", once: "radar-\(session)-\(cam.key)")
+                }
             }
         }
         if let lim = s.limit, settings?.speedAlerts ?? true, s.speedKmh > Double(lim) + 7 {
