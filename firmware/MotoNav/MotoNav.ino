@@ -1137,10 +1137,25 @@ int es7210Read(uint8_t r) {
   return v;
 }
 
-bool micInit() {
-  if (micReady) return true;
+int micVariant = 0;
+int micChannels = 2;
+
+bool micStart(int variant) {
+  if (micReady) {
+    micI2S.end();
+    micReady = false;
+  }
   micI2S.setPins(MIC_BCLK, MIC_LRCK, MIC_DOUT, MIC_DIN, MIC_MCLK);
-  if (!micI2S.begin(I2S_MODE_STD, VOICE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) return false;
+  bool began;
+  if (variant == 1) {
+    micChannels = 4;
+    began = micI2S.begin(I2S_MODE_TDM, VOICE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, 0x0F);
+  } else {
+    micChannels = 2;
+    began = micI2S.begin(I2S_MODE_STD, VOICE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH);
+  }
+  if (!began) return false;
+  micVariant = variant;
   delay(30);
   for (uint8_t a = 0x40; a <= 0x43; a++) {
     es7210Addr = a;
@@ -1148,7 +1163,7 @@ bool micInit() {
     if (id == 0x72) break;
     if (a == 0x43) es7210Addr = 0x40;
   }
-  micChipId = es7210Read(0xFD);
+  micChipId = es7210Read(0x3D);
   bool ok = true;
   auto upd = [&](uint8_t r, uint8_t mask, uint8_t val) {
     int v = es7210Read(r);
@@ -1169,7 +1184,7 @@ bool micInit() {
   ok &= es7210Write(0x41, 0x70);
   ok &= es7210Write(0x42, 0x70);
   ok &= es7210Write(0x11, 0x60);
-  ok &= es7210Write(0x12, 0x00);
+  ok &= es7210Write(0x12, variant == 1 ? 0x02 : 0x00);
   ok &= es7210Write(0x02, 0xC1);
   ok &= es7210Write(0x07, 0x20);
   ok &= es7210Write(0x04, 0x01);
@@ -1201,7 +1216,13 @@ bool micInit() {
   ok &= es7210Write(0x00, 0x41);
   Serial.printf("es7210 id=%02X%02X ok=%d\n", es7210Read(0xFD), es7210Read(0xFE), ok);
   micReady = ok;
+  delay(120);
   return ok;
+}
+
+bool micInit() {
+  if (micReady) return true;
+  return micStart(micVariant);
 }
 
 const int8_t imaIdx[16] = {-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8};
@@ -1301,7 +1322,7 @@ void voiceSend(const int16_t *pcm, size_t total) {
 void voiceTask(void *) {
   int16_t *bufL = (int16_t *)heap_caps_malloc(VOICE_MAX_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
   int16_t *bufR = (int16_t *)heap_caps_malloc(VOICE_MAX_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-  int16_t *stereo = (int16_t *)heap_caps_malloc(VOICE_FRAME * 2 * sizeof(int16_t), MALLOC_CAP_INTERNAL);
+  int16_t *stereo = (int16_t *)heap_caps_malloc(VOICE_FRAME * 4 * sizeof(int16_t), MALLOC_CAP_INTERNAL);
   for (;;) {
     if (!voiceRequested) {
       if (voiceAnswerAt && millis() - voiceAnswerAt > 9000) {
@@ -1322,7 +1343,19 @@ void voiceTask(void *) {
       setVoiceToast("Microfone indisponível", "Falha ao iniciar", 4000);
       continue;
     }
-    for (int i = 0; i < 6; i++) micI2S.readBytes((char *)stereo, VOICE_FRAME * 4);
+    for (int attempt = 0; attempt < 2; attempt++) {
+      int16_t w = 0;
+      for (int i = 0; i < 8; i++) {
+        micI2S.readBytes((char *)stereo, VOICE_FRAME * micChannels * 2);
+        for (int k = 0; k < VOICE_FRAME * micChannels; k++) w = max<int>(w, abs((int)stereo[k]));
+      }
+      Serial.printf("mic variant=%d channels=%d warm=%d\n", micVariant, micChannels, (int)w);
+      if (w > 0) break;
+      if (attempt == 0) {
+        setVoiceToast("Ajustando microfone", "", 4000);
+        if (!micStart(micVariant == 0 ? 1 : 0)) break;
+      }
+    }
     setVoiceToast("Ouvindo...", "Fale agora", 12000);
     size_t total = 0;
     int frames = 0, quiet = 0;
@@ -1330,11 +1363,11 @@ void voiceTask(void *) {
     float floorRms = 1e9f, peak = 0, peakL = 0, peakR = 0;
     double eL = 0, eR = 0;
     while (total + VOICE_FRAME <= VOICE_MAX_SAMPLES) {
-      size_t got = micI2S.readBytes((char *)stereo, VOICE_FRAME * 4);
-      if (got < VOICE_FRAME * 4) break;
+      size_t got = micI2S.readBytes((char *)stereo, VOICE_FRAME * micChannels * 2);
+      if (got < (size_t)VOICE_FRAME * micChannels * 2) break;
       double fl = 0, fr = 0;
       for (int i = 0; i < VOICE_FRAME; i++) {
-        int16_t l = stereo[2 * i], r = stereo[2 * i + 1];
+        int16_t l = stereo[micChannels * i], r = stereo[micChannels * i + (micChannels == 4 ? 2 : 1)];
         bufL[total + i] = l;
         bufR[total + i] = r;
         fl += (double)l * l;
@@ -1366,7 +1399,7 @@ void voiceTask(void *) {
     Serial.printf("voice: samples=%u speech=%d floor=%.0f peakL=%.0f peakR=%.0f\n", (unsigned)total, speech, floorRms, peakL, peakR);
     if (!speech && peak < 150) {
       char m[48];
-      snprintf(m, sizeof(m), "Nível %d/%d chip %02X@%02X", (int)peakL, (int)peakR, micChipId & 255, es7210Addr);
+      snprintf(m, sizeof(m), "Nv %d/%d id%02X m%d", (int)peakL, (int)peakR, micChipId & 255, micVariant);
       setVoiceToast("Não ouvi nada", m, 6000);
       continue;
     }
