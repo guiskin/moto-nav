@@ -1224,6 +1224,8 @@ void micDiag() {
   Serial.printf("diag es8311 id=%02X %02X %02X regs 00=%02X 0D=%02X 0E=%02X\n", i2cReadReg(0x18, 0xFD) & 255, i2cReadReg(0x18, 0xFE) & 255, i2cReadReg(0x18, 0xFF) & 255, i2cReadReg(0x18, 0x00) & 255, i2cReadReg(0x18, 0x0D) & 255, i2cReadReg(0x18, 0x0E) & 255);
   Serial.printf("diag tca9554 in=%02X out=%02X cfg=%02X\n", i2cReadReg(0x20, 0x00) & 255, i2cReadReg(0x20, 0x01) & 255, i2cReadReg(0x20, 0x03) & 255);
   Serial.printf("diag pins toggles: mclk=%u bclk=%u lrck=%u din=%u dout=%u\n", (unsigned)pinToggles(MIC_MCLK), (unsigned)pinToggles(MIC_BCLK), (unsigned)pinToggles(MIC_LRCK), (unsigned)pinToggles(MIC_DIN), (unsigned)pinToggles(MIC_DOUT));
+  for (int r = 0; r <= 0x17; r++) Serial.printf("e8311 %02X=%02X\n", r, i2cReadReg(0x18, r) & 255);
+  Serial.printf("e8311 44=%02X 45=%02X\n", i2cReadReg(0x18, 0x44) & 255, i2cReadReg(0x18, 0x45) & 255);
   static const uint8_t regs[] = {0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x11, 0x12, 0x3D, 0x3E, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x4B, 0x4C};
   for (uint8_t r : regs) Serial.printf("diag reg %02X=%02X\n", r, es7210Read(r) & 255);
 }
