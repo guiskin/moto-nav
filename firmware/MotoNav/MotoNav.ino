@@ -1211,9 +1211,10 @@ bool micStart(int variant) {
   ok &= es7210Write(0x48, 0x08);
   ok &= es7210Write(0x49, 0x08);
   ok &= es7210Write(0x4A, 0x08);
-  ok &= es7210Write(0x06, 0x04);
-  ok &= es7210Write(0x4B, 0x0F);
-  ok &= es7210Write(0x4C, 0x0F);
+  ok &= es7210Write(0x06, 0x00);
+  ok &= es7210Write(0x4B, 0x00);
+  ok &= es7210Write(0x4C, 0x00);
+  ok &= es7210Write(0x01, 0x00);
   ok &= es7210Write(0x00, 0x71);
   ok &= es7210Write(0x00, 0x41);
   Serial.printf("es7210 id=%02X%02X ok=%d\n", es7210Read(0xFD), es7210Read(0xFE), ok);
