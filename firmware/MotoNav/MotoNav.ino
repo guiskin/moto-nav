@@ -1234,7 +1234,39 @@ uint32_t pinToggles(int pin) {
   return n;
 }
 
+bool i2cWriteReg(uint8_t addr, uint8_t r, uint8_t v) {
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  Wire.beginTransmission(addr);
+  Wire.write(r);
+  Wire.write(v);
+  bool ok = Wire.endTransmission() == 0;
+  xSemaphoreGive(i2cMutex);
+  return ok;
+}
+
+int i2cReadReg(uint8_t addr, uint8_t r) {
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  Wire.beginTransmission(addr);
+  Wire.write(r);
+  int v = -1;
+  if (Wire.endTransmission(false) == 0 && Wire.requestFrom(addr, (uint8_t)1) == 1) v = Wire.read();
+  xSemaphoreGive(i2cMutex);
+  return v;
+}
+
 void micDiag() {
+  gpio_pullup_en((gpio_num_t)MIC_DIN);
+  gpio_pulldown_dis((gpio_num_t)MIC_DIN);
+  delay(2);
+  int up = gpio_get_level((gpio_num_t)MIC_DIN);
+  gpio_pullup_dis((gpio_num_t)MIC_DIN);
+  gpio_pulldown_en((gpio_num_t)MIC_DIN);
+  delay(2);
+  int dn = gpio_get_level((gpio_num_t)MIC_DIN);
+  gpio_pulldown_dis((gpio_num_t)MIC_DIN);
+  Serial.printf("diag din level pullup=%d pulldown=%d\n", up, dn);
+  Serial.printf("diag es8311 id=%02X %02X %02X regs 00=%02X 0D=%02X 0E=%02X\n", i2cReadReg(0x18, 0xFD) & 255, i2cReadReg(0x18, 0xFE) & 255, i2cReadReg(0x18, 0xFF) & 255, i2cReadReg(0x18, 0x00) & 255, i2cReadReg(0x18, 0x0D) & 255, i2cReadReg(0x18, 0x0E) & 255);
+  Serial.printf("diag tca9554 in=%02X out=%02X cfg=%02X\n", i2cReadReg(0x20, 0x00) & 255, i2cReadReg(0x20, 0x01) & 255, i2cReadReg(0x20, 0x03) & 255);
   Serial.printf("diag pins toggles: mclk=%u bclk=%u lrck=%u din=%u dout=%u\n", (unsigned)pinToggles(MIC_MCLK), (unsigned)pinToggles(MIC_BCLK), (unsigned)pinToggles(MIC_LRCK), (unsigned)pinToggles(MIC_DIN), (unsigned)pinToggles(MIC_DOUT));
   static const uint8_t regs[] = {0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x11, 0x12, 0x3D, 0x3E, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x4B, 0x4C};
   for (uint8_t r : regs) Serial.printf("diag reg %02X=%02X\n", r, es7210Read(r) & 255);
@@ -1364,7 +1396,7 @@ void voiceTask(void *) {
       continue;
     }
     micDiag();
-    for (int attempt = 0; attempt < 2; attempt++) {
+    for (int attempt = 0; attempt < 3; attempt++) {
       int16_t w = 0;
       for (int i = 0; i < 8; i++) {
         micI2S.readBytes((char *)stereo, VOICE_FRAME * micChannels * 2);
@@ -1375,7 +1407,13 @@ void voiceTask(void *) {
       if (w > 0) break;
       if (attempt == 0) {
         setVoiceToast("Ajustando microfone", "", 4000);
-        if (!micStart(micVariant == 0 ? 1 : 0)) break;
+        if (!micStart(1)) break;
+      } else if (attempt == 1) {
+        i2cWriteReg(0x18, 0x00, 0x1F);
+        delay(5);
+        i2cWriteReg(0x18, 0x00, 0x00);
+        i2cWriteReg(0x18, 0x0D, 0xFF);
+        if (!micStart(0)) break;
       }
     }
     setVoiceToast("Ouvindo...", "Fale agora", 12000);
