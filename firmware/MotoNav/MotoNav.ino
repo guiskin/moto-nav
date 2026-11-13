@@ -12,6 +12,7 @@
 #include <esp_heap_caps.h>
 #include <Update.h>
 #include <ESP_I2S.h>
+#include <driver/gpio.h>
 #define XPOWERS_CHIP_AXP2101
 #include "XPowersLib.h"
 #include <host/ble_hs.h>
@@ -1221,6 +1222,24 @@ bool micStart(int variant) {
   return ok;
 }
 
+uint32_t pinToggles(int pin) {
+  gpio_input_enable((gpio_num_t)pin);
+  int last = gpio_get_level((gpio_num_t)pin);
+  uint32_t n = 0;
+  for (int i = 0; i < 40000; i++) {
+    int v = gpio_get_level((gpio_num_t)pin);
+    if (v != last) n++;
+    last = v;
+  }
+  return n;
+}
+
+void micDiag() {
+  Serial.printf("diag pins toggles: mclk=%u bclk=%u lrck=%u din=%u dout=%u\n", (unsigned)pinToggles(MIC_MCLK), (unsigned)pinToggles(MIC_BCLK), (unsigned)pinToggles(MIC_LRCK), (unsigned)pinToggles(MIC_DIN), (unsigned)pinToggles(MIC_DOUT));
+  static const uint8_t regs[] = {0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x11, 0x12, 0x3D, 0x3E, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x4B, 0x4C};
+  for (uint8_t r : regs) Serial.printf("diag reg %02X=%02X\n", r, es7210Read(r) & 255);
+}
+
 bool micInit() {
   if (micReady) return true;
   return micStart(micVariant);
@@ -1344,13 +1363,15 @@ void voiceTask(void *) {
       setVoiceToast("Microfone indisponível", "Falha ao iniciar", 4000);
       continue;
     }
+    micDiag();
     for (int attempt = 0; attempt < 2; attempt++) {
       int16_t w = 0;
       for (int i = 0; i < 8; i++) {
         micI2S.readBytes((char *)stereo, VOICE_FRAME * micChannels * 2);
         for (int k = 0; k < VOICE_FRAME * micChannels; k++) w = max<int>(w, abs((int)stereo[k]));
       }
-      Serial.printf("mic variant=%d channels=%d warm=%d\n", micVariant, micChannels, (int)w);
+      Serial.printf("mic variant=%d channels=%d warm=%d raw=%d,%d,%d,%d\n", micVariant, micChannels, (int)w, stereo[0], stereo[1], stereo[2], stereo[3]);
+      if (w == 0) micDiag();
       if (w > 0) break;
       if (attempt == 0) {
         setVoiceToast("Ajustando microfone", "", 4000);
