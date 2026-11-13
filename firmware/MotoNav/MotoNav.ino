@@ -1276,7 +1276,8 @@ void voiceSend(const int16_t *pcm, size_t total) {
 }
 
 void voiceTask(void *) {
-  int16_t *buf = (int16_t *)heap_caps_malloc(VOICE_MAX_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+  int16_t *bufL = (int16_t *)heap_caps_malloc(VOICE_MAX_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+  int16_t *bufR = (int16_t *)heap_caps_malloc(VOICE_MAX_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
   int16_t *stereo = (int16_t *)heap_caps_malloc(VOICE_FRAME * 2 * sizeof(int16_t), MALLOC_CAP_INTERNAL);
   for (;;) {
     if (!voiceRequested) {
@@ -1288,7 +1289,7 @@ void voiceTask(void *) {
       continue;
     }
     voiceRequested = false;
-    if (!buf || !stereo || otaActive) continue;
+    if (!bufL || !bufR || !stereo || otaActive) continue;
     if (!bleConnected) {
       setVoiceToast("Sem conexão", "iPhone desconectado", 3000);
       continue;
@@ -1298,52 +1299,74 @@ void voiceTask(void *) {
       setVoiceToast("Microfone indisponível", "Falha ao iniciar", 4000);
       continue;
     }
-    micI2S.readBytes((char *)stereo, VOICE_FRAME * 4);
+    for (int i = 0; i < 6; i++) micI2S.readBytes((char *)stereo, VOICE_FRAME * 4);
     setVoiceToast("Ouvindo...", "Fale agora", 12000);
     size_t total = 0;
     int frames = 0, quiet = 0;
     bool speech = false;
-    float floorRms = 0, peak = 0;
+    float floorRms = 1e9f, peak = 0, peakL = 0, peakR = 0;
+    double eL = 0, eR = 0;
     while (total + VOICE_FRAME <= VOICE_MAX_SAMPLES) {
       size_t got = micI2S.readBytes((char *)stereo, VOICE_FRAME * 4);
       if (got < VOICE_FRAME * 4) break;
-      double e = 0;
+      double fl = 0, fr = 0;
       for (int i = 0; i < VOICE_FRAME; i++) {
-        int v = stereo[2 * i] + stereo[2 * i + 1];
-        if (v > 32767) v = 32767;
-        if (v < -32768) v = -32768;
-        buf[total + i] = v;
-        e += (double)v * v;
+        int16_t l = stereo[2 * i], r = stereo[2 * i + 1];
+        bufL[total + i] = l;
+        bufR[total + i] = r;
+        fl += (double)l * l;
+        fr += (double)r * r;
       }
-      float rms = sqrt(e / VOICE_FRAME);
-      if (rms > peak) peak = rms;
+      eL += fl;
+      eR += fr;
+      float rl = sqrt(fl / VOICE_FRAME), rr = sqrt(fr / VOICE_FRAME);
+      float rms = max(rl, rr);
+      peakL = max(peakL, rl);
+      peakR = max(peakR, rr);
+      peak = max(peak, rms);
       frames++;
       total += VOICE_FRAME;
-      if (frames >= 10 && frames < 20) floorRms = max(floorRms, rms);
-      if (frames >= 20) {
-        float thr = max(700.0f, floorRms * 2.5f);
+      if (frames >= 3 && frames < 25) floorRms = min(floorRms, rms);
+      if (frames >= 8) {
+        float base = floorRms > 1e8f ? 100.0f : floorRms;
+        float thr = max(300.0f, base * 3.0f);
         if (rms > thr) {
           speech = true;
           quiet = 0;
         } else if (speech) {
           quiet++;
         }
-        if (speech && quiet >= 45) break;
+        if (speech && quiet >= 50) break;
         if (!speech && total > (size_t)VOICE_RATE * 5) break;
       }
     }
-    Serial.printf("voice: samples=%u speech=%d floor=%.0f peak=%.0f\n", (unsigned)total, speech, floorRms, peak);
-    if (!speech) {
+    Serial.printf("voice: samples=%u speech=%d floor=%.0f peakL=%.0f peakR=%.0f\n", (unsigned)total, speech, floorRms, peakL, peakR);
+    if (!speech && peak < 150) {
       char m[48];
-      snprintf(m, sizeof(m), "Nível %d", (int)peak);
-      setVoiceToast("Não ouvi nada", m, 3500);
+      snprintf(m, sizeof(m), "Nível %d / %d", (int)peakL, (int)peakR);
+      setVoiceToast("Não ouvi nada", m, 4500);
       continue;
     }
+    int16_t *pcm = eL >= eR ? bufL : bufR;
     size_t trim = (size_t)quiet > 20 ? (quiet - 20) * VOICE_FRAME : 0;
     size_t sendN = total > trim ? total - trim : total;
-    setVoiceToast("Enviando...", "", 10000);
-    voiceSend(buf, sendN);
-    setVoiceToast("Entendendo...", "", 12000);
+    int pk = 1;
+    for (size_t i = 0; i < sendN; i++) {
+      int v = abs((int)pcm[i]);
+      if (v > pk) pk = v;
+    }
+    float gain = constrain(24000.0f / pk, 1.0f, 24.0f);
+    if (gain > 1.05f) {
+      for (size_t i = 0; i < sendN; i++) {
+        int v = (int)(pcm[i] * gain);
+        pcm[i] = constrain(v, -32768, 32767);
+      }
+    }
+    char m[48];
+    snprintf(m, sizeof(m), "Nível %d / %d", (int)peakL, (int)peakR);
+    setVoiceToast("Enviando...", m, 10000);
+    voiceSend(pcm, sendN);
+    setVoiceToast("Entendendo...", m, 12000);
     voiceAnswerAt = millis();
   }
 }
