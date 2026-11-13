@@ -1099,7 +1099,8 @@ void musicCommand(uint8_t cmd) {
   ble_gattc_write_flat(connHandle, ios.rcVal, &cmd, 1, nullptr, nullptr);
 }
 
-#define ES7210_ADDR 0x40
+uint8_t es7210Addr = 0x40;
+int micChipId = -1;
 #define MIC_MCLK 42
 #define MIC_BCLK 9
 #define MIC_LRCK 45
@@ -1118,7 +1119,7 @@ uint8_t voiceSession = 0;
 
 bool es7210Write(uint8_t r, uint8_t v) {
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
-  Wire.beginTransmission(ES7210_ADDR);
+  Wire.beginTransmission(es7210Addr);
   Wire.write(r);
   Wire.write(v);
   bool ok = Wire.endTransmission() == 0;
@@ -1128,10 +1129,10 @@ bool es7210Write(uint8_t r, uint8_t v) {
 
 int es7210Read(uint8_t r) {
   xSemaphoreTake(i2cMutex, portMAX_DELAY);
-  Wire.beginTransmission(ES7210_ADDR);
+  Wire.beginTransmission(es7210Addr);
   Wire.write(r);
   int v = -1;
-  if (Wire.endTransmission(false) == 0 && Wire.requestFrom((uint8_t)ES7210_ADDR, (uint8_t)1) == 1) v = Wire.read();
+  if (Wire.endTransmission(false) == 0 && Wire.requestFrom((uint8_t)es7210Addr, (uint8_t)1) == 1) v = Wire.read();
   xSemaphoreGive(i2cMutex);
   return v;
 }
@@ -1141,7 +1142,19 @@ bool micInit() {
   micI2S.setPins(MIC_BCLK, MIC_LRCK, MIC_DOUT, MIC_DIN, MIC_MCLK);
   if (!micI2S.begin(I2S_MODE_STD, VOICE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) return false;
   delay(30);
+  for (uint8_t a = 0x40; a <= 0x43; a++) {
+    es7210Addr = a;
+    int id = es7210Read(0xFD);
+    if (id == 0x72) break;
+    if (a == 0x43) es7210Addr = 0x40;
+  }
+  micChipId = es7210Read(0xFD);
   bool ok = true;
+  auto upd = [&](uint8_t r, uint8_t mask, uint8_t val) {
+    int v = es7210Read(r);
+    if (v < 0) v = 0;
+    return es7210Write(r, (uint8_t)((v & ~mask) | (val & mask)));
+  };
   ok &= es7210Write(0x00, 0xFF);
   ok &= es7210Write(0x00, 0x32);
   ok &= es7210Write(0x01, 0x3F);
@@ -1151,8 +1164,7 @@ bool micInit() {
   ok &= es7210Write(0x22, 0x0A);
   ok &= es7210Write(0x20, 0x0A);
   ok &= es7210Write(0x21, 0x2A);
-  int m = es7210Read(0x08);
-  ok &= es7210Write(0x08, m < 0 ? 0x10 : (m & ~0x01));
+  ok &= upd(0x08, 0x01, 0x00);
   ok &= es7210Write(0x40, 0xC3);
   ok &= es7210Write(0x41, 0x70);
   ok &= es7210Write(0x42, 0x70);
@@ -1162,18 +1174,29 @@ bool micInit() {
   ok &= es7210Write(0x07, 0x20);
   ok &= es7210Write(0x04, 0x01);
   ok &= es7210Write(0x05, 0x00);
-  ok &= es7210Write(0x43, 0x1A);
-  ok &= es7210Write(0x44, 0x1A);
-  ok &= es7210Write(0x45, 0x1A);
-  ok &= es7210Write(0x46, 0x1A);
+  for (uint8_t r = 0x43; r <= 0x46; r++) ok &= upd(r, 0x10, 0x00);
+  ok &= es7210Write(0x4B, 0xFF);
+  ok &= es7210Write(0x4C, 0xFF);
+  const uint8_t gainCode = 0x0A;
+  ok &= upd(0x01, 0x0B, 0x00);
+  ok &= es7210Write(0x4B, 0x00);
+  ok &= upd(0x43, 0x1F, 0x10 | gainCode);
+  ok &= upd(0x01, 0x0B, 0x00);
+  ok &= es7210Write(0x4B, 0x00);
+  ok &= upd(0x44, 0x1F, 0x10 | gainCode);
+  ok &= upd(0x01, 0x15, 0x00);
+  ok &= es7210Write(0x4C, 0x00);
+  ok &= upd(0x45, 0x1F, 0x10 | gainCode);
+  ok &= upd(0x01, 0x15, 0x00);
+  ok &= es7210Write(0x4C, 0x00);
+  ok &= upd(0x46, 0x1F, 0x10 | gainCode);
   ok &= es7210Write(0x47, 0x08);
   ok &= es7210Write(0x48, 0x08);
   ok &= es7210Write(0x49, 0x08);
   ok &= es7210Write(0x4A, 0x08);
   ok &= es7210Write(0x06, 0x04);
-  ok &= es7210Write(0x01, 0x00);
-  ok &= es7210Write(0x4B, 0x00);
-  ok &= es7210Write(0x4C, 0x00);
+  ok &= es7210Write(0x4B, 0x0F);
+  ok &= es7210Write(0x4C, 0x0F);
   ok &= es7210Write(0x00, 0x71);
   ok &= es7210Write(0x00, 0x41);
   Serial.printf("es7210 id=%02X%02X ok=%d\n", es7210Read(0xFD), es7210Read(0xFE), ok);
@@ -1343,8 +1366,8 @@ void voiceTask(void *) {
     Serial.printf("voice: samples=%u speech=%d floor=%.0f peakL=%.0f peakR=%.0f\n", (unsigned)total, speech, floorRms, peakL, peakR);
     if (!speech && peak < 150) {
       char m[48];
-      snprintf(m, sizeof(m), "Nível %d / %d", (int)peakL, (int)peakR);
-      setVoiceToast("Não ouvi nada", m, 4500);
+      snprintf(m, sizeof(m), "Nível %d/%d chip %02X@%02X", (int)peakL, (int)peakR, micChipId & 255, es7210Addr);
+      setVoiceToast("Não ouvi nada", m, 6000);
       continue;
     }
     int16_t *pcm = eL >= eR ? bufL : bufR;
