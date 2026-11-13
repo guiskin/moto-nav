@@ -280,6 +280,7 @@ uint32_t otaGot = 0;
 
 uint32_t lastActivity = 0;
 bool screenOff = false;
+bool screenLocked = false;
 
 uint8_t *rxBuf = nullptr;
 uint32_t rxTotal = 0;
@@ -2322,6 +2323,10 @@ void setup() {
   if (pmuOk) {
     pmu.enableBattDetection();
     pmu.enableBattVoltageMeasure();
+    pmu.disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
+    pmu.clearIrqStatus();
+    pmu.enableIRQ(XPOWERS_AXP2101_PKEY_SHORT_IRQ);
+    pmu.setPowerKeyPressOffTime(XPOWERS_POWEROFF_6S);
   }
   lastActivity = millis();
   xTaskCreatePinnedToCore(rxTask, "rx", 8192, nullptr, 3, nullptr, 0);
@@ -2329,6 +2334,18 @@ void setup() {
   xTaskCreatePinnedToCore(voiceTask, "voice", 8192, nullptr, 2, nullptr, 0);
   bleInit();
   xTaskCreatePinnedToCore(iosTask, "ios", 6144, nullptr, 2, nullptr, 0);
+}
+
+bool pollPowerKey(uint32_t now) {
+  static uint32_t lastPoll = 0;
+  if (!pmuOk || now - lastPoll < 80) return false;
+  lastPoll = now;
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  pmu.getIrqStatus();
+  bool pressed = pmu.isPekeyShortPressIrq();
+  if (pressed) pmu.clearIrqStatus();
+  xSemaphoreGive(i2cMutex);
+  return pressed;
 }
 
 Tap readInput(uint32_t now) {
@@ -2457,6 +2474,16 @@ void loop() {
   if (screenIdx >= count) screenIdx = 0;
 
   Tap tp = readInput(now);
+  if (pollPowerKey(now)) {
+    screenLocked = !screenLocked;
+    lastActivity = now;
+    navDirty = true;
+    if (!screenLocked) screenOff = false;
+  }
+  if (screenLocked) {
+    tp.tapped = false;
+    voiceRequested = false;
+  }
   if (tp.tapped) {
     bool wasOff = screenOff;
     lastActivity = now;
@@ -2486,13 +2513,17 @@ void loop() {
   portEXIT_CRITICAL(&gpsMux);
   updateRadarFlash(now);
   if (mode != 0 || otaActive) lastActivity = now;
-  if (screenOff && now - lastActivity < SLEEP_AFTER_MS) {
-    screenOff = false;
-    navDirty = true;
-  }
-  if (!screenOff && now - lastActivity > SLEEP_AFTER_MS) {
+  if (screenLocked) {
     screenOff = true;
-    navDirty = true;
+  } else {
+    if (screenOff && now - lastActivity < SLEEP_AFTER_MS) {
+      screenOff = false;
+      navDirty = true;
+    }
+    if (!screenOff && now - lastActivity > SLEEP_AFTER_MS) {
+      screenOff = true;
+      navDirty = true;
+    }
   }
   applyDisplaySettings(now);
   if (screenOff) {
