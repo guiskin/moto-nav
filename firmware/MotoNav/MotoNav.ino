@@ -12,6 +12,7 @@
 #include <esp_heap_caps.h>
 #include <Update.h>
 #include <ESP_I2S.h>
+#include "es8311.h"
 #include <driver/gpio.h>
 #define XPOWERS_CHIP_AXP2101
 #include "XPowersLib.h"
@@ -1159,65 +1160,19 @@ bool micStart(int variant) {
   if (!began) return false;
   micVariant = variant;
   delay(30);
-  for (uint8_t a = 0x40; a <= 0x43; a++) {
-    es7210Addr = a;
-    int id = es7210Read(0xFD);
-    if (id == 0x72) break;
-    if (a == 0x43) es7210Addr = 0x40;
-  }
-  micChipId = es7210Read(0x3D);
+  micChipId = 0x83;
   bool ok = true;
-  auto upd = [&](uint8_t r, uint8_t mask, uint8_t val) {
-    int v = es7210Read(r);
-    if (v < 0) v = 0;
-    return es7210Write(r, (uint8_t)((v & ~mask) | (val & mask)));
-  };
-  ok &= es7210Write(0x00, 0xFF);
-  ok &= es7210Write(0x00, 0x32);
-  ok &= es7210Write(0x01, 0x3F);
-  ok &= es7210Write(0x09, 0x30);
-  ok &= es7210Write(0x0A, 0x30);
-  ok &= es7210Write(0x23, 0x2A);
-  ok &= es7210Write(0x22, 0x0A);
-  ok &= es7210Write(0x20, 0x0A);
-  ok &= es7210Write(0x21, 0x2A);
-  ok &= upd(0x08, 0x01, 0x00);
-  ok &= es7210Write(0x40, 0xC3);
-  ok &= es7210Write(0x41, 0x70);
-  ok &= es7210Write(0x42, 0x70);
-  ok &= es7210Write(0x11, 0x60);
-  ok &= es7210Write(0x12, variant == 1 ? 0x02 : 0x00);
-  ok &= es7210Write(0x02, 0xC1);
-  ok &= es7210Write(0x07, 0x20);
-  ok &= es7210Write(0x04, 0x01);
-  ok &= es7210Write(0x05, 0x00);
-  for (uint8_t r = 0x43; r <= 0x46; r++) ok &= upd(r, 0x10, 0x00);
-  ok &= es7210Write(0x4B, 0xFF);
-  ok &= es7210Write(0x4C, 0xFF);
-  const uint8_t gainCode = 0x0A;
-  ok &= upd(0x01, 0x0B, 0x00);
-  ok &= es7210Write(0x4B, 0x00);
-  ok &= upd(0x43, 0x1F, 0x10 | gainCode);
-  ok &= upd(0x01, 0x0B, 0x00);
-  ok &= es7210Write(0x4B, 0x00);
-  ok &= upd(0x44, 0x1F, 0x10 | gainCode);
-  ok &= upd(0x01, 0x15, 0x00);
-  ok &= es7210Write(0x4C, 0x00);
-  ok &= upd(0x45, 0x1F, 0x10 | gainCode);
-  ok &= upd(0x01, 0x15, 0x00);
-  ok &= es7210Write(0x4C, 0x00);
-  ok &= upd(0x46, 0x1F, 0x10 | gainCode);
-  ok &= es7210Write(0x47, 0x08);
-  ok &= es7210Write(0x48, 0x08);
-  ok &= es7210Write(0x49, 0x08);
-  ok &= es7210Write(0x4A, 0x08);
-  ok &= es7210Write(0x06, 0x00);
-  ok &= es7210Write(0x4B, 0x00);
-  ok &= es7210Write(0x4C, 0x00);
-  ok &= es7210Write(0x01, 0x00);
-  ok &= es7210Write(0x00, 0x71);
-  ok &= es7210Write(0x00, 0x41);
-  Serial.printf("es7210 id=%02X%02X ok=%d\n", es7210Read(0xFD), es7210Read(0xFE), ok);
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  es8311_handle_t h = es8311_create(0, ES8311_ADDRRES_0);
+  if (h) {
+    es8311_clock_config_t clk = {false, false, true, VOICE_RATE * 256, VOICE_RATE};
+    ok &= es8311_init(h, &clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16) == ESP_OK;
+    ok &= es8311_sample_frequency_config(h, clk.mclk_frequency, clk.sample_frequency) == ESP_OK;
+    ok &= es8311_microphone_config(h, false) == ESP_OK;
+    ok &= es8311_microphone_gain_set(h, ES8311_MIC_GAIN_24DB) == ESP_OK;
+  } else ok = false;
+  xSemaphoreGive(i2cMutex);
+  Serial.printf("es8311 mic init ok=%d\n", ok);
   micReady = ok;
   delay(120);
   return ok;
