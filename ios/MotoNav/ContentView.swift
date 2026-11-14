@@ -238,6 +238,7 @@ struct ContentView: View {
                 if s.maneuver == .roundabout && s.exitNumber > 0 {
                     Text("\(s.exitNumber)ª saída").font(.subheadline).foregroundStyle(.secondary)
                 }
+                if let l = s.lanes { LaneStrip(info: l) }
                 limitRadarLine(s)
                 if let cd = s.curveDistance {
                     Label("\(abs(s.curveAngle) >= 90 ? "Curva acentuada" : "Curva") \(s.curveAngle > 0 ? "à direita" : "à esquerda") em \(Format.distance(cd))",
@@ -413,5 +414,33 @@ enum Format {
         let min = Int((t / 60).rounded(.up))
         if min < 60 { return "\(min) min" }
         return String(format: "%dh%02d", min / 60, min % 60)
+    }
+}
+
+
+struct LaneStrip: View {
+    let info: LaneInfo
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(0..<info.dirs.count, id: \.self) { i in
+                let ok = info.valid & UInt8(1 << i) != 0
+                Image(systemName: symbol(info.dirs[i]))
+                    .font(.system(size: 18, weight: .bold))
+                    .frame(width: 26, height: 32)
+                    .foregroundStyle(ok ? Color.white : Color.gray.opacity(0.7))
+                    .background(ok ? Color.blue : Color.gray.opacity(0.2), in: RoundedRectangle(cornerRadius: 5))
+            }
+        }
+    }
+
+    private func symbol(_ d: UInt8) -> String {
+        let r = d & LaneInfo.right != 0, l = d & LaneInfo.left != 0, t = d & LaneInfo.through != 0
+        if d & LaneInfo.reverse != 0 && !r && !t { return "arrow.uturn.left" }
+        if t && r { return "arrow.up.right" }
+        if t && l { return "arrow.up.left" }
+        if r { return "arrow.turn.up.right" }
+        if l { return "arrow.turn.up.left" }
+        return "arrow.up"
     }
 }

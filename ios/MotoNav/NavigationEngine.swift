@@ -20,6 +20,7 @@ struct NavSnapshot: Equatable {
     var roadName: String?
     var radarDistance: Double?
     var tripDistance: Double = 0
+    var lanes: LaneInfo?
 }
 
 @MainActor
@@ -57,6 +58,8 @@ final class NavigationEngine: ObservableObject {
     private var heartbeat: Timer?
     private var lastFix: CLLocation?
     private var geometryVersion = 0
+    private var laneCache: [String: LaneInfo] = [:]
+    private var laneAttempt: [String: Date] = [:]
     private var session: UInt16 = 0
     private var projection: LocalProjection?
     private var tiles: TileManager?
@@ -386,6 +389,21 @@ final class NavigationEngine: ObservableObject {
             s.instruction = g.instructions[k]
             s.street = m.code == .arrive ? (destination?.name ?? "Destino") : RouteGeometry.street(from: g.instructions[k])
             if m.code == .arrive { s.distanceToManeuver = s.remainingDistance }
+            let laneKey = "\(geometryVersion)-\(k)"
+            if s.distanceToManeuver <= 450 { s.lanes = laneCache[laneKey] }
+            if s.distanceToManeuver <= 900, laneCache[laneKey] == nil, LaneService.need(for: m.code) != nil,
+               Date().timeIntervalSince(laneAttempt[laneKey] ?? .distantPast) > 40 {
+                laneAttempt[laneKey] = Date()
+                let at = g.stepStart[k]
+                let p = g.point(at: max(0, at - 15))
+                let b = Geo.bearing(g.point(at: max(0, at - 40)), g.point(at: max(0, at - 5)))
+                let code = m.code
+                Task { [weak self] in
+                    if let info = await LaneService.fetch(near: p, bearing: b, code: code) {
+                        self?.laneCache[laneKey] = info
+                    }
+                }
+            }
         } else {
             s.maneuver = .arrive
             s.distanceToManeuver = s.remainingDistance
@@ -500,6 +518,7 @@ final class NavigationEngine: ObservableObject {
             appendLE(&d, UInt16(0))
         }
         ble.sendPosition(d)
+        ble.sendPosition(snapshot.lanes?.packet() ?? LaneInfo.empty)
     }
 
     private func reroute(from loc: CLLocation) {

@@ -127,6 +127,16 @@ struct AlertData {
   uint32_t ms;
 };
 
+struct LaneData {
+  uint8_t count;
+  uint8_t valid;
+  uint8_t dirs[8];
+  uint32_t ms;
+};
+
+portMUX_TYPE laneMux = portMUX_INITIALIZER_UNLOCKED;
+LaneData laneShared = {};
+
 struct StatusData {
   uint8_t limit;
   uint16_t radarDist;
@@ -626,6 +636,20 @@ void handleAlertPacket(const uint8_t *p, size_t n) {
   portENTER_CRITICAL(&alertMux);
   alertShared = a;
   portEXIT_CRITICAL(&alertMux);
+}
+
+void handleLanePacket(const uint8_t *p, size_t n) {
+  if (n < 3) return;
+  LaneData l = {};
+  uint8_t c = p[1];
+  if (c > 8 || n < (size_t)(3 + c)) c = 0;
+  l.count = c;
+  l.valid = p[2];
+  for (uint8_t i = 0; i < c; i++) l.dirs[i] = p[3 + i];
+  l.ms = millis();
+  portENTER_CRITICAL(&laneMux);
+  laneShared = l;
+  portEXIT_CRITICAL(&laneMux);
 }
 
 void handleStatusPacket(const uint8_t *p, size_t n) {
@@ -1467,6 +1491,7 @@ void rxTask(void *) {
       case 0x04: handleStatusPacket(it.data, it.len); break;
       case 0x05: handleSettingsPacket(it.data, it.len); break;
       case 0x06: handleVoiceResult(it.data, it.len); break;
+      case 0x07: handleLanePacket(it.data, it.len); break;
       case 0x20:
       case 0x21:
       case 0x22: handleOtaPacket(it.data, it.len); break;
@@ -1971,6 +1996,52 @@ void drawOtaScreen() {
   textCentered("Não desligue", 370, u8g2_font_helvB18_tf, C_DIM);
 }
 
+void thickLine(int x0, int y0, int x1, int y1, uint16_t c) {
+  gfx->drawLine(x0, y0, x1, y1, c);
+  gfx->drawLine(x0 - 1, y0, x1 - 1, y1, c);
+  gfx->drawLine(x0 + 1, y0, x1 + 1, y1, c);
+}
+
+void drawLaneArrow(int cx, int cy, uint8_t d, uint16_t c) {
+  bool t = d & 2, r = d & 4, l = d & 1;
+  if (d & 8 && !t && !r) l = true;
+  if (t) {
+    thickLine(cx, cy + 15, cx, cy - 9, c);
+    gfx->fillTriangle(cx, cy - 15, cx - 7, cy - 6, cx + 7, cy - 6, c);
+  } else {
+    thickLine(cx, cy + 15, cx, cy + 1, c);
+  }
+  if (r) {
+    thickLine(cx, cy + 1, cx + 9, cy - 8, c);
+    gfx->fillTriangle(cx + 14, cy - 13, cx + 4, cy - 11, cx + 12, cy - 3, c);
+  }
+  if (l) {
+    thickLine(cx, cy + 1, cx - 9, cy - 8, c);
+    gfx->fillTriangle(cx - 14, cy - 13, cx - 4, cy - 11, cx - 12, cy - 3, c);
+  }
+}
+
+bool laneActive(LaneData &l) {
+  portENTER_CRITICAL(&laneMux);
+  l = laneShared;
+  portEXIT_CRITICAL(&laneMux);
+  return l.count >= 2 && millis() - l.ms < 5000;
+}
+
+void drawLanes(int top) {
+  LaneData l;
+  if (!laneActive(l)) return;
+  const int w = 40, h = 50, gap = 5;
+  int total = l.count * w + (l.count - 1) * gap;
+  int x = CX - total / 2;
+  for (uint8_t i = 0; i < l.count; i++) {
+    bool ok = l.valid & (1 << i);
+    gfx->fillRoundRect(x, top, w, h, 7, ok ? 0x0AB6 : 0x1082);
+    drawLaneArrow(x + w / 2, top + h / 2 + 2, l.dirs[i], ok ? 0xFFFF : 0x5AEB);
+    x += w + gap;
+  }
+}
+
 void drawNavScreen(const NavData &n) {
   gfx->fillScreen(C_BG);
   char b[48];
@@ -1983,6 +2054,7 @@ void drawNavScreen(const NavData &n) {
     textCentered(b, 120, u8g2_font_logisoso42_tr, approaching ? C_ORANGE : C_FG);
   }
   drawManeuver(n, CX, 220, 1.0f, C_BG);
+  drawLanes(305);
   AlertData a;
   if (curveActive(a)) drawCurveBadge(CX + 150, 220, a.angle, a.dist);
   drawStatusBadges(CX - 150, 150, CX - 145, 250, n.speedKmh);
@@ -2095,6 +2167,7 @@ void drawMapOverlay(const NavData &n, float speedKmh) {
   if (approaching && !cruise) panelBg = blinkOn() ? 0xC300 : C_PANEL;
   gfx->fillRect(0, 0, LCD_W, 118, panelBg);
   gfx->drawFastHLine(0, 118, LCD_W, 0x2104);
+  if (!(n.flags & 0x02)) drawLanes(128);
   char b[128];
   if (cruise) {
     GpsData g;
