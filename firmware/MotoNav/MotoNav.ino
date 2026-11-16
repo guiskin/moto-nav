@@ -1888,15 +1888,28 @@ void drawRadarFlash(uint32_t now) {
 
 void drawBatteryIcon() {
   int bp = batteryPct;
-  if (bp < 0) return;
+  GpsData g;
+  portENTER_CRITICAL(&gpsMux);
+  g = gpsShared;
+  portEXIT_CRITICAL(&gpsMux);
+  char tm[8] = "";
+  if (g.timeValid) snprintf(tm, sizeof(tm), "%02u:%02u", g.hour, g.minute);
+  if (bp < 0 && !tm[0]) return;
   bool chg = charging;
   uint16_t col = chg ? C_GREEN : (bp < 15 ? C_RED : (bp < 30 ? C_ORANGE : C_FG));
-  char b[8];
-  snprintf(b, sizeof(b), "%d%%", bp);
+  char b[8] = "";
+  if (bp >= 0) snprintf(b, sizeof(b), "%d%%", bp);
   gfx->setFont(u8g2_font_helvB14_tf);
-  int tw = textWidth(b);
-  int total = 26 + 3 + 5 + tw;
-  int x = CX - total / 2, y = 10;
+  int tw = b[0] ? textWidth(b) : 0;
+  int battW = b[0] ? 26 + 3 + 5 + tw : 0;
+  int timeW = tm[0] ? textWidth(tm) : 0;
+  int gap = (tm[0] && b[0]) ? 14 : 0;
+  int x = CX - (timeW + gap + battW) / 2, y = 10;
+  if (tm[0]) {
+    textAt(tm, x, y + 12, u8g2_font_helvB14_tf, C_FG);
+    x += timeW + gap;
+  }
+  if (!b[0]) return;
   gfx->drawRect(x, y, 26, 13, col);
   gfx->fillRect(x + 26, y + 4, 3, 5, col);
   int fill = max(1, min(22, bp * 22 / 100));
