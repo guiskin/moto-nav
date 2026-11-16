@@ -2578,6 +2578,7 @@ Tap readInput(uint32_t now) {
   static bool touching = false;
   static int16_t sx = 0, sy = 0, lx = 0, ly = 0;
   static uint32_t lastTouchMs = 0;
+  static bool swiped = false;
   if (touchPending) {
     touchPending = false;
     if (touchOk) {
@@ -2594,16 +2595,21 @@ Tap readInput(uint32_t now) {
         lx = x[0];
         ly = y[0];
         lastTouchMs = now;
+        int ddx = lx - sx, ddy = ly - sy;
+        if (!swiped && abs(ddx) >= 50 && abs(ddx) * 2 > abs(ddy) * 3) {
+          t.swipe = ddx < 0 ? -1 : 1;
+          t.tapped = true;
+          swiped = true;
+          lastTap = now;
+        }
       }
     }
   }
-  if (touching && now - lastTouchMs > 120) {
+  if (touching && now - lastTouchMs > 90) {
     touching = false;
     int dx = lx - sx, dy = ly - sy;
-    if (abs(dx) >= 50 && abs(dx) * 2 > abs(dy) * 3) {
-      t.swipe = dx < 0 ? -1 : 1;
-      t.tapped = true;
-      lastTap = now;
+    if (swiped) {
+      swiped = false;
     } else if (abs(dx) < 35 && abs(dy) < 35) {
       t.tapped = true;
       t.x = sx;
@@ -2845,12 +2851,18 @@ void loop() {
       screenIdx = transIdx;
       renderFrame(list[screenIdx], mode, n, g, t, mapReady, now, count, screenIdx);
       memcpy(tbNew, fb, bytes);
-      const int steps = 8;
-      for (int k = 1; k <= steps; k++) {
-        float p = (float)k / steps;
-        float q = 1.0f - p;
-        int off = (int)((1.0f - q * q * q) * LCD_W);
-        if (k == steps) off = LCD_W;
+      setCpuFrequencyMhz(240);
+      cpuMhz = 240;
+      const uint32_t dur = 240;
+      uint32_t t0 = millis();
+      while (true) {
+        uint32_t el = millis() - t0;
+        bool last = el >= dur;
+        int off = LCD_W;
+        if (!last) {
+          float q = 1.0f - (float)el / dur;
+          off = (int)((1.0f - q * q * q) * LCD_W);
+        }
         for (int y = 0; y < LCD_H; y++) {
           uint16_t *dst = fb + (size_t)y * LCD_W;
           const uint16_t *o = tbOld + (size_t)y * LCD_W;
@@ -2864,6 +2876,7 @@ void loop() {
           }
         }
         gfx->flush();
+        if (last) break;
       }
       navDirty = true;
       return;
