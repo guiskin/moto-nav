@@ -31,6 +31,9 @@ final class NavigationEngine: ObservableObject {
 
     @Published private(set) var mode: Mode = .idle
     @Published private(set) var route: MKRoute?
+    @Published private(set) var alternatives: [MKRoute] = []
+    @Published private(set) var selectedAlt = 0
+    @Published private(set) var previewDelayMin: Int?
     @Published private(set) var destination: MKMapItem?
     @Published private(set) var snapshot = NavSnapshot()
     @Published private(set) var calculating = false
@@ -114,25 +117,52 @@ final class NavigationEngine: ObservableObject {
         calculating = true
         defer { calculating = false }
         do {
-            let r = try await calculate(from: from.coordinate, to: item)
-            setRoute(r)
+            let all = try await calculateAll(from: from.coordinate, to: item)
+            alternatives = all
+            selectedAlt = 0
+            previewDelayMin = nil
+            setRoute(all[0])
             mode = .preview
+            let main = all[0].expectedTravelTime
+            Task { [weak self] in
+                var night = Calendar.current.date(bySettingHour: 3, minute: 0, second: 0, of: Date()) ?? Date()
+                if night <= Date().addingTimeInterval(600) { night = night.addingTimeInterval(86_400) }
+                let r = MKDirections.Request()
+                r.source = MKMapItem(placemark: MKPlacemark(coordinate: from.coordinate))
+                r.destination = item
+                r.transportType = .automobile
+                r.departureDate = night
+                if let f = try? await MKDirections(request: r).calculateETA().expectedTravelTime {
+                    self?.previewDelayMin = max(0, Int(((main - f) / 60).rounded()))
+                }
+            }
         } catch {
             errorText = "Não foi possível calcular a rota."
         }
     }
 
+    func selectAlternative(_ i: Int) {
+        guard mode == .preview, alternatives.indices.contains(i) else { return }
+        selectedAlt = i
+        setRoute(alternatives[i])
+    }
+
     private func calculate(from: CLLocationCoordinate2D, to item: MKMapItem) async throws -> MKRoute {
+        guard let r = try await calculateAll(from: from, to: item).first else { throw URLError(.cannotFindHost) }
+        return r
+    }
+
+    private func calculateAll(from: CLLocationCoordinate2D, to item: MKMapItem) async throws -> [MKRoute] {
         let req = MKDirections.Request()
         req.source = MKMapItem(placemark: MKPlacemark(coordinate: from))
         req.destination = item
         req.transportType = .automobile
-        req.requestsAlternateRoutes = false
+        req.requestsAlternateRoutes = true
         req.tollPreference = avoidTolls ? .avoid : .any
         req.highwayPreference = avoidHighways ? .avoid : .any
         let resp = try await MKDirections(request: req).calculate()
-        guard let r = resp.routes.first else { throw URLError(.cannotFindHost) }
-        return r
+        guard !resp.routes.isEmpty else { throw URLError(.cannotFindHost) }
+        return Array(resp.routes.prefix(3))
     }
 
     private func setRoute(_ r: MKRoute) {
@@ -379,6 +409,9 @@ final class NavigationEngine: ObservableObject {
         routeOnBoardVersion = -1
         mapStatus = nil
         mode = .idle
+        alternatives = []
+        selectedAlt = 0
+        previewDelayMin = nil
         route = nil
         geometry = nil
         destination = nil

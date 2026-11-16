@@ -21,6 +21,13 @@ struct ContentView: View {
         ZStack(alignment: .top) {
             Map(position: $camera) {
                 UserAnnotation()
+                if engine.mode == .preview {
+                    ForEach(Array(engine.alternatives.enumerated()), id: \.offset) { i, r in
+                        if i != engine.selectedAlt {
+                            MapPolyline(r.polyline).stroke(.gray.opacity(0.7), lineWidth: 5)
+                        }
+                    }
+                }
                 if let r = engine.route {
                     MapPolyline(r.polyline).stroke(.blue, lineWidth: 6)
                 }
@@ -28,6 +35,7 @@ struct ContentView: View {
                     Marker(d.name ?? "Destino", coordinate: d.placemark.coordinate)
                 }
             }
+            .mapStyle(.standard(showsTraffic: true))
             .mapControls {
                 MapUserLocationButton()
                 MapCompass()
@@ -195,9 +203,34 @@ struct ContentView: View {
                         .foregroundStyle(.yellow)
                 }
             }
-            if let r = engine.route {
+            if engine.alternatives.count > 1 {
+                HStack(spacing: 8) {
+                    ForEach(Array(engine.alternatives.enumerated()), id: \.offset) { i, r in
+                        Button { engine.selectAlternative(i) } label: {
+                            VStack(spacing: 2) {
+                                Text(Format.duration(r.expectedTravelTime)).font(.subheadline.bold())
+                                Text(Format.distance(r.distance)).font(.caption)
+                                if i > 0, let base = engine.alternatives.first {
+                                    let d = Int(((r.expectedTravelTime - base.expectedTravelTime) / 60).rounded())
+                                    Text(d >= 0 ? "+\(d) min" : "\(d) min").font(.caption2)
+                                        .foregroundStyle(d > 0 ? .orange : .green)
+                                }
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6)
+                            .background(i == engine.selectedAlt ? Color.blue.opacity(0.25) : Color.gray.opacity(0.15), in: RoundedRectangle(cornerRadius: 8))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            } else if let r = engine.route {
                 Text("\(Format.distance(r.distance)) · \(Format.duration(r.expectedTravelTime))")
                     .foregroundStyle(.secondary)
+            }
+            if engine.selectedAlt == 0, let d = engine.previewDelayMin {
+                Label(d >= 3 ? "Trânsito agora: +\(d) min" : "Trânsito livre", systemImage: d >= 3 ? "car.fill" : "checkmark.circle.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(d >= 10 ? .red : (d >= 3 ? .orange : .green))
             }
             Toggle("Evitar pedágios", isOn: $engine.avoidTolls)
             Toggle("Evitar rodovias", isOn: $engine.avoidHighways)
