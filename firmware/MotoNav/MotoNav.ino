@@ -2794,8 +2794,13 @@ void loop() {
     }
   }
   applyDisplaySettings(now);
+  static uint32_t cpuMhz = 240;
+  if (screenOff && !otaActive && cpuMhz != 80) {
+    setCpuFrequencyMhz(80);
+    cpuMhz = 80;
+  }
   if (screenOff) {
-    delay(20);
+    delay(40);
     return;
   }
 
@@ -2807,7 +2812,12 @@ void loop() {
   uint8_t scr = list[screenIdx];
   bool animating = mode != 0 && scr == SCR_MAP && mapReady && !otaActive;
 
-  uint32_t interval = animating ? 40 : ((approaching || radarFlashing(now)) ? 100 : (mode != 0 ? 250 : 1000));
+  uint32_t wantMhz = animating ? 240 : 160;
+  if (wantMhz != cpuMhz) {
+    setCpuFrequencyMhz(wantMhz);
+    cpuMhz = wantMhz;
+  }
+  uint32_t interval = animating ? 50 : ((approaching || radarFlashing(now)) ? 100 : (mode != 0 ? 250 : 1000));
   if (otaActive) interval = 200;
   if (!navDirty && now - lastDraw < interval) {
     delay(5);

@@ -12,9 +12,9 @@ final class LocationProvider: NSObject, ObservableObject, CLLocationManagerDeleg
     override init() {
         super.init()
         manager.delegate = self
-        manager.desiredAccuracy = kCLLocationAccuracyBestForNavigation
+        manager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
         manager.activityType = .automotiveNavigation
-        manager.distanceFilter = kCLDistanceFilterNone
+        manager.distanceFilter = 20
         manager.pausesLocationUpdatesAutomatically = false
     }
 
@@ -31,6 +31,8 @@ final class LocationProvider: NSObject, ObservableObject, CLLocationManagerDeleg
 
     func setBackground(_ enabled: Bool) {
         guard authorized else { return }
+        manager.desiredAccuracy = enabled ? kCLLocationAccuracyBestForNavigation : kCLLocationAccuracyNearestTenMeters
+        manager.distanceFilter = enabled ? kCLDistanceFilterNone : 20
         manager.allowsBackgroundLocationUpdates = enabled
         manager.showsBackgroundLocationIndicator = enabled
     }
