@@ -17,6 +17,20 @@ struct LaneInfo: Equatable {
     }
 
     static var empty: Data { Data([0x07, 0, 0]) }
+
+    var spoken: String {
+        let n = dirs.count
+        let idx = (0..<n).filter { valid & UInt8(1 << $0) != 0 }
+        guard let first = idx.first, let last = idx.last else { return "" }
+        let k = idx.count
+        if last == n - 1 && idx == Array((n - k)..<n) {
+            return k == 1 ? "Fique na faixa da direita" : "Fique nas \(k) faixas da direita"
+        }
+        if first == 0 && idx == Array(0..<k) {
+            return k == 1 ? "Fique na faixa da esquerda" : "Fique nas \(k) faixas da esquerda"
+        }
+        return "Fique na faixa \(first + 1) da esquerda para a direita"
+    }
 }
 
 enum LaneService {
@@ -31,8 +45,8 @@ enum LaneService {
 
     static func need(for code: ManeuverCode) -> UInt8? {
         switch code {
-        case .right, .sharpRight, .slightRight: return LaneInfo.right
-        case .left, .sharpLeft, .slightLeft: return LaneInfo.left
+        case .right, .sharpRight, .slightRight, .keepRight: return LaneInfo.right
+        case .left, .sharpLeft, .slightLeft, .keepLeft: return LaneInfo.left
         case .straight: return LaneInfo.through
         case .uturn: return LaneInfo.left | LaneInfo.reverse
         default: return nil

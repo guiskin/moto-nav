@@ -492,7 +492,10 @@ final class NavigationEngine: ObservableObject {
             s.street = m.code == .arrive ? (destination?.name ?? "Destino") : RouteGeometry.street(from: g.instructions[k])
             if m.code == .arrive { s.distanceToManeuver = s.remainingDistance }
             let laneKey = "\(geometryVersion)-\(k)"
-            if s.distanceToManeuver <= 450 { s.lanes = laneCache[laneKey] }
+            if s.distanceToManeuver <= 450 {
+                s.lanes = laneCache[laneKey]
+                if let l = s.lanes { voice.say(l.spoken, once: "lane-\(laneKey)") }
+            }
             if s.distanceToManeuver <= 900, laneCache[laneKey] == nil, LaneService.need(for: m.code) != nil,
                Date().timeIntervalSince(laneAttempt[laneKey] ?? .distantPast) > 40 {
                 laneAttempt[laneKey] = Date()
