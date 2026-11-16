@@ -138,6 +138,10 @@ final class NavigationEngine: ObservableObject {
     func pushSettings() {
         guard let ble = ble, let settings = settings else { return }
         lastSettingsPush = Date()
+        let local = UInt32(clamping: Int(Date().timeIntervalSince1970) + TimeZone.current.secondsFromGMT())
+        var t = Data([0x08])
+        appendLE(&t, local)
+        ble.sendPosition(t)
         ble.sendPosition(settings.packet(coordinate: location?.location?.coordinate))
     }
 

@@ -100,6 +100,9 @@ struct NavData {
   char text[128];
 };
 
+volatile uint32_t phoneEpoch = 0;
+volatile uint32_t phoneEpochMs = 0;
+
 struct GpsData {
   bool timeValid;
   uint8_t hour;
@@ -360,6 +363,12 @@ void gpsTask(void *) {
     g.timeValid = gps.time.isValid();
     g.hour = (gps.time.hour() + 24 + TZ_OFFSET_H) % 24;
     g.minute = gps.time.minute();
+    if (!g.timeValid && phoneEpoch != 0) {
+      uint32_t sec = phoneEpoch + (millis() - phoneEpochMs) / 1000;
+      g.timeValid = true;
+      g.hour = (sec / 3600) % 24;
+      g.minute = (sec / 60) % 60;
+    }
     g.fix = gps.location.isValid() && gps.location.age() < 3000;
     g.kmph = gps.speed.isValid() ? gps.speed.kmph() : 0;
     g.sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
@@ -650,6 +659,12 @@ void handleLanePacket(const uint8_t *p, size_t n) {
   portENTER_CRITICAL(&laneMux);
   laneShared = l;
   portEXIT_CRITICAL(&laneMux);
+}
+
+void handleTimePacket(const uint8_t *p, size_t n) {
+  if (n < 5) return;
+  phoneEpoch = p[1] | (p[2] << 8) | (p[3] << 16) | ((uint32_t)p[4] << 24);
+  phoneEpochMs = millis();
 }
 
 void handleStatusPacket(const uint8_t *p, size_t n) {
@@ -1492,6 +1507,7 @@ void rxTask(void *) {
       case 0x05: handleSettingsPacket(it.data, it.len); break;
       case 0x06: handleVoiceResult(it.data, it.len); break;
       case 0x07: handleLanePacket(it.data, it.len); break;
+      case 0x08: handleTimePacket(it.data, it.len); break;
       case 0x20:
       case 0x21:
       case 0x22: handleOtaPacket(it.data, it.len); break;
