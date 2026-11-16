@@ -140,6 +140,21 @@ struct LaneData {
 portMUX_TYPE laneMux = portMUX_INITIALIZER_UNLOCKED;
 LaneData laneShared = {};
 
+struct ExtraData {
+  uint8_t avg;
+  uint8_t mx;
+  uint16_t tripDm;
+  int16_t delay;
+  uint8_t wx;
+  int8_t temp;
+  uint16_t rainMin;
+  uint32_t msStats;
+  uint32_t msEnv;
+};
+
+portMUX_TYPE extraMux = portMUX_INITIALIZER_UNLOCKED;
+ExtraData extraShared = {};
+
 struct StatusData {
   uint8_t limit;
   uint16_t radarDist;
@@ -214,6 +229,7 @@ struct View {
 struct Tap {
   bool tapped;
   bool button;
+  int8_t swipe;
   int16_t x;
   int16_t y;
 };
@@ -261,7 +277,11 @@ volatile int mapProgress = -1;
 volatile bool touchPending = false;
 bool nightMode = false;
 
-enum : uint8_t { SCR_MAP = 0, SCR_ARROW = 1, SCR_MUSIC = 2, SCR_IDLE = 3 };
+enum : uint8_t { SCR_MAP = 0, SCR_ARROW = 1, SCR_MUSIC = 2, SCR_IDLE = 3, SCR_STATS = 4 };
+int8_t transDir = 0;
+uint8_t transIdx = 0;
+uint16_t *tbOld = nullptr;
+uint16_t *tbNew = nullptr;
 uint8_t screenIdx = 0;
 uint8_t lastMode = 255;
 
@@ -665,6 +685,27 @@ void handleTimePacket(const uint8_t *p, size_t n) {
   if (n < 5) return;
   phoneEpoch = p[1] | (p[2] << 8) | (p[3] << 16) | ((uint32_t)p[4] << 24);
   phoneEpochMs = millis();
+}
+
+void handleStatsPacket(const uint8_t *p, size_t n) {
+  if (n < 5) return;
+  portENTER_CRITICAL(&extraMux);
+  extraShared.avg = p[1];
+  extraShared.mx = p[2];
+  extraShared.tripDm = rd16(p + 3);
+  extraShared.msStats = millis();
+  portEXIT_CRITICAL(&extraMux);
+}
+
+void handleEnvPacket(const uint8_t *p, size_t n) {
+  if (n < 7) return;
+  portENTER_CRITICAL(&extraMux);
+  extraShared.delay = (int16_t)rd16(p + 1);
+  extraShared.wx = p[3];
+  extraShared.temp = (int8_t)p[4];
+  extraShared.rainMin = rd16(p + 5);
+  extraShared.msEnv = millis();
+  portEXIT_CRITICAL(&extraMux);
 }
 
 void handleStatusPacket(const uint8_t *p, size_t n) {
@@ -1491,7 +1532,9 @@ void handleVoiceResult(const uint8_t *p, size_t n) {
   memcpy(t, p + 2, l);
   t[l] = 0;
   voiceAnswerAt = 0;
-  setVoiceToast(p[1] == 1 ? "Ok" : "Não entendi", t, 5000);
+  if (p[1] == 2) setVoiceToast("Manutenção", t, 9000);
+  else if (p[1] == 3) setVoiceToast("Clima", t, 9000);
+  else setVoiceToast(p[1] == 1 ? "Ok" : "Não entendi", t, 5000);
 }
 
 void rxTask(void *) {
@@ -1508,6 +1551,8 @@ void rxTask(void *) {
       case 0x06: handleVoiceResult(it.data, it.len); break;
       case 0x07: handleLanePacket(it.data, it.len); break;
       case 0x08: handleTimePacket(it.data, it.len); break;
+      case 0x09: handleStatsPacket(it.data, it.len); break;
+      case 0x0A: handleEnvPacket(it.data, it.len); break;
       case 0x20:
       case 0x21:
       case 0x22: handleOtaPacket(it.data, it.len); break;
@@ -2071,6 +2116,48 @@ void drawLanes(int top) {
   }
 }
 
+bool extraFresh(ExtraData &e, bool env) {
+  portENTER_CRITICAL(&extraMux);
+  e = extraShared;
+  portEXIT_CRITICAL(&extraMux);
+  uint32_t ms = env ? e.msEnv : e.msStats;
+  return ms != 0 && millis() - ms < (env ? 120000UL : 15000UL);
+}
+
+void drawStatsScreen() {
+  gfx->fillScreen(C_BG);
+  ExtraData e;
+  bool okS = extraFresh(e, false);
+  bool okE = extraFresh(e, true);
+  char b[40];
+  textCentered("Trajeto", 66, u8g2_font_helvB14_tf, C_DIM);
+  textCentered("MÉDIA", 108, u8g2_font_helvB14_tf, C_DIM);
+  snprintf(b, sizeof(b), okS ? "%u km/h" : "-- km/h", e.avg);
+  textCentered(b, 162, u8g2_font_logisoso42_tr, C_FG);
+  textCentered("MÁXIMA", 204, u8g2_font_helvB14_tf, C_DIM);
+  snprintf(b, sizeof(b), okS ? "%u km/h" : "-- km/h", e.mx);
+  textCentered(b, 258, u8g2_font_logisoso42_tr, C_FG);
+  textCentered("DISTÂNCIA", 298, u8g2_font_helvB14_tf, C_DIM);
+  if (okS) snprintf(b, sizeof(b), "%u.%u km", e.tripDm / 10, e.tripDm % 10);
+  else snprintf(b, sizeof(b), "-- km");
+  textCentered(b, 344, u8g2_font_logisoso32_tr, C_FG);
+  if (okE && e.delay >= 3) {
+    snprintf(b, sizeof(b), "Trânsito +%d min", e.delay);
+    textCentered(b, 392, u8g2_font_helvB14_tf, e.delay >= 10 ? C_RED : C_ORANGE);
+  }
+  if (okE) {
+    if (e.wx == 3) textCentered("Tempestade à frente", 424, u8g2_font_helvB14_tf, C_RED);
+    else if (e.wx == 2) textCentered("Chovendo agora", 424, u8g2_font_helvB14_tf, C_ACCENT);
+    else if (e.wx == 1) {
+      snprintf(b, sizeof(b), "Chuva em %u min", e.rainMin);
+      textCentered(b, 424, u8g2_font_helvB14_tf, C_ACCENT);
+    } else {
+      snprintf(b, sizeof(b), "%d°C", (int)e.temp);
+      textCentered(b, 424, u8g2_font_helvB14_tf, C_DIM);
+    }
+  }
+}
+
 void drawNavScreen(const NavData &n) {
   gfx->fillScreen(C_BG);
   char b[48];
@@ -2488,6 +2575,9 @@ Tap readInput(uint32_t now) {
     t.tapped = true;
     t.button = true;
   }
+  static bool touching = false;
+  static int16_t sx = 0, sy = 0, lx = 0, ly = 0;
+  static uint32_t lastTouchMs = 0;
   if (touchPending) {
     touchPending = false;
     if (touchOk) {
@@ -2496,14 +2586,32 @@ Tap readInput(uint32_t now) {
       uint8_t pts = touch.getPoint(x, y, 1);
       xSemaphoreGive(i2cMutex);
       if (pts > 0) {
-        t.tapped = true;
-        t.x = x[0];
-        t.y = y[0];
+        if (!touching) {
+          touching = true;
+          sx = x[0];
+          sy = y[0];
+        }
+        lx = x[0];
+        ly = y[0];
+        lastTouchMs = now;
       }
     }
   }
-  if (t.tapped && now - lastTap < 350) t.tapped = false;
-  if (t.tapped) lastTap = now;
+  if (touching && now - lastTouchMs > 120) {
+    touching = false;
+    int dx = lx - sx, dy = ly - sy;
+    if (abs(dx) >= 50 && abs(dx) * 2 > abs(dy) * 3) {
+      t.swipe = dx < 0 ? -1 : 1;
+      t.tapped = true;
+      lastTap = now;
+    } else if (abs(dx) < 35 && abs(dy) < 35) {
+      t.tapped = true;
+      t.x = sx;
+      t.y = sy;
+    }
+  }
+  if (t.tapped && !t.swipe && now - lastTap < 350) t.tapped = false;
+  if (t.tapped && !t.swipe) lastTap = now;
   return t;
 }
 
@@ -2515,13 +2623,15 @@ uint8_t screensFor(uint8_t mode, uint8_t *list) {
   }
   if (mode == 2) {
     list[0] = SCR_MAP;
-    list[1] = SCR_MUSIC;
-    return 2;
+    list[1] = SCR_STATS;
+    list[2] = SCR_MUSIC;
+    return 3;
   }
   list[0] = SCR_MAP;
   list[1] = SCR_ARROW;
-  list[2] = SCR_MUSIC;
-  return 3;
+  list[2] = SCR_STATS;
+  list[3] = SCR_MUSIC;
+  return 4;
 }
 
 void applyDisplaySettings(uint32_t now) {
@@ -2562,6 +2672,41 @@ void applyDisplaySettings(uint32_t now) {
   }
 }
 
+void drawPageDots(uint8_t count, uint8_t idx) {
+  if (count < 2) return;
+  for (uint8_t i = 0; i < count; i++) {
+    int x = CX + (int)((i - (count - 1) / 2.0f) * 14);
+    if (i == idx) gfx->fillCircle(x, 455, 3, C_FG);
+    else gfx->fillCircle(x, 455, 2, 0x4208);
+  }
+}
+
+void renderFrame(uint8_t scr, uint8_t mode, const NavData &n, const GpsData &g, const PosTarget &t, bool mapReady, uint32_t now, uint8_t count, uint8_t idx) {
+  if (scr == SCR_MUSIC) {
+    drawMusicScreen();
+  } else if (scr == SCR_STATS) {
+    drawStatsScreen();
+  } else if (mode == 0) {
+    cam.init = false;
+    drawIdleScreen(g, bleConnected);
+  } else if (scr == SCR_ARROW) {
+    drawNavScreen(n);
+  } else if (mapReady) {
+    drawMapScreen(n, t, now);
+  } else {
+    int mp = mapProgress;
+    char msg[40];
+    if (mp >= 0 && mp < 100) snprintf(msg, sizeof(msg), "Recebendo mapa %d%%", mp);
+    else snprintf(msg, sizeof(msg), "Aguardando mapa...");
+    drawWaitingMap(n, msg);
+  }
+  if (mode == 1) drawAlertRing();
+  if (mode != 0) drawRadarFlash(now);
+  drawBatteryIcon();
+  drawPageDots(count, idx);
+  drawToast();
+}
+
 void loop() {
   static uint32_t lastDraw = 0;
   uint32_t now = millis();
@@ -2588,7 +2733,7 @@ void loop() {
     navDirty = true;
     lastActivity = now;
   }
-  uint8_t list[3];
+  uint8_t list[4];
   uint8_t count = screensFor(mode, list);
   if (screenIdx >= count) screenIdx = 0;
 
@@ -2617,12 +2762,16 @@ void loop() {
       portENTER_CRITICAL(&toastMux);
       toastShared.active = false;
       portEXIT_CRITICAL(&toastMux);
-    } else if (list[screenIdx] == SCR_MUSIC && !tp.button && tp.y > 290) {
+    } else if (tp.swipe) {
+      transIdx = tp.swipe < 0 ? (screenIdx + 1) % count : (screenIdx + count - 1) % count;
+      transDir = tp.swipe < 0 ? 1 : -1;
+    } else if (tp.button) {
+      transIdx = (screenIdx + 1) % count;
+      transDir = 1;
+    } else if (list[screenIdx] == SCR_MUSIC && tp.y > 290) {
       if (tp.x < CX - 60) musicCommand(4);
       else if (tp.x > CX + 60) musicCommand(3);
       else musicCommand(2);
-    } else {
-      screenIdx = (screenIdx + 1) % count;
     }
   }
 
@@ -2672,25 +2821,46 @@ void loop() {
     gfx->flush();
     return;
   }
-  if (scr == SCR_MUSIC) {
-    drawMusicScreen();
-  } else if (mode == 0) {
-    cam.init = false;
-    drawIdleScreen(g, bleConnected);
-  } else if (scr == SCR_ARROW) {
-    drawNavScreen(n);
-  } else if (mapReady) {
-    drawMapScreen(n, t, now);
-  } else {
-    int mp = mapProgress;
-    char msg[40];
-    if (mp >= 0 && mp < 100) snprintf(msg, sizeof(msg), "Recebendo mapa %d%%", mp);
-    else snprintf(msg, sizeof(msg), "Aguardando mapa...");
-    drawWaitingMap(n, msg);
+  if (transDir != 0) {
+    size_t bytes = (size_t)LCD_W * LCD_H * 2;
+    if (!tbOld) {
+      tbOld = (uint16_t *)ps_malloc(bytes);
+      tbNew = (uint16_t *)ps_malloc(bytes);
+    }
+    uint16_t *fb = gfx->getFramebuffer();
+    int8_t dir = transDir;
+    transDir = 0;
+    if (tbOld && tbNew && fb) {
+      memcpy(tbOld, fb, bytes);
+      screenIdx = transIdx;
+      renderFrame(list[screenIdx], mode, n, g, t, mapReady, now, count, screenIdx);
+      memcpy(tbNew, fb, bytes);
+      const int steps = 8;
+      for (int k = 1; k <= steps; k++) {
+        float p = (float)k / steps;
+        float q = 1.0f - p;
+        int off = (int)((1.0f - q * q * q) * LCD_W);
+        if (k == steps) off = LCD_W;
+        for (int y = 0; y < LCD_H; y++) {
+          uint16_t *dst = fb + (size_t)y * LCD_W;
+          const uint16_t *o = tbOld + (size_t)y * LCD_W;
+          const uint16_t *nw = tbNew + (size_t)y * LCD_W;
+          if (dir > 0) {
+            memcpy(dst, o + off, (LCD_W - off) * 2);
+            memcpy(dst + (LCD_W - off), nw, off * 2);
+          } else {
+            memcpy(dst + off, o, (LCD_W - off) * 2);
+            memcpy(dst, nw + (LCD_W - off), off * 2);
+          }
+        }
+        gfx->flush();
+      }
+      navDirty = true;
+      return;
+    }
+    screenIdx = transIdx;
+    scr = list[screenIdx];
   }
-  if (mode == 1) drawAlertRing();
-  if (mode != 0) drawRadarFlash(now);
-  drawBatteryIcon();
-  drawToast();
+  renderFrame(scr, mode, n, g, t, mapReady, now, count, screenIdx);
   gfx->flush();
 }
