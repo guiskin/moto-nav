@@ -23,6 +23,8 @@ final class TripRecorder {
     private(set) var distance: Double = 0
     private(set) var movingTime: TimeInterval = 0
     private(set) var maxSpeed: Double = 0
+    var avgKmh: Double { movingTime > 5 ? distance / movingTime * 3.6 : 0 }
+    var maxKmh: Double { maxSpeed * 3.6 }
     private var points: [[Double]] = []
 
     init(title: String) {

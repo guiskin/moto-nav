@@ -10,6 +10,7 @@ struct MotoNavApp: App {
     @StateObject private var trips = TripStore()
     @StateObject private var playlists = PlaylistStore()
     @StateObject private var voiceCenter = VoiceCommandCenter()
+    @StateObject private var maintenance = MaintenanceStore()
 
     var body: some Scene {
         WindowGroup {
@@ -22,8 +23,9 @@ struct MotoNavApp: App {
                 .environmentObject(trips)
                 .environmentObject(playlists)
                 .environmentObject(voiceCenter)
+                .environmentObject(maintenance)
                 .onAppear {
-                    engine.attach(location: location, ble: ble, settings: settings, trips: trips)
+                    engine.attach(location: location, ble: ble, settings: settings, trips: trips, maintenance: maintenance)
                     voiceCenter.attach(ble: ble, engine: engine, places: places, playlists: playlists)
                     location.start()
                 }

@@ -33,6 +33,10 @@ struct SettingsView: View {
                     Toggle("Notificações do iPhone na placa", isOn: $settings.boardNotifications)
                 }
 
+                Section {
+                    NavigationLink("Lembretes de manutenção") { MaintenanceView() }
+                }
+
                 Section("Alertas") {
                     Toggle("Avisos por voz", isOn: $engine.voiceEnabled)
                     Toggle("Aviso de velocidade acima do limite", isOn: $settings.speedAlerts)

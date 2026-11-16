@@ -68,12 +68,20 @@ final class NavigationEngine: ObservableObject {
     private var routeOnBoardVersion = -1
     private weak var settings: SettingsStore?
     private weak var trips: TripStore?
+    private weak var maintenance: MaintenanceStore?
+    private var lastTrafficCheck = Date.distantPast
+    private var lastWeatherCheck = Date.distantPast
+    private var trafficDelayMin = 0
+    private var weather: WeatherInfo?
+    private var lastWeatherAlert = Date.distantPast
+    private var lastEnvSend = Date.distantPast
     private var trip: TripRecorder?
     private var overSince: Date?
     private var lastOverAlert = Date.distantPast
     private var lastSettingsPush = Date.distantPast
 
-    func attach(location: LocationProvider, ble: BLEManager, settings: SettingsStore, trips: TripStore) {
+    func attach(location: LocationProvider, ble: BLEManager, settings: SettingsStore, trips: TripStore, maintenance: MaintenanceStore) {
+        self.maintenance = maintenance
         self.location = location
         self.ble = ble
         self.settings = settings
@@ -90,6 +98,7 @@ final class NavigationEngine: ObservableObject {
                 guard let self = self else { return }
                 self.pushToDevice()
                 self.resendPosition()
+                self.sendExtras()
                 if Date().timeIntervalSince(self.lastSettingsPush) > 30 { self.pushSettings() }
             }
         }
@@ -135,6 +144,89 @@ final class NavigationEngine: ObservableObject {
         if mode == .navigating { uploadRoute() }
     }
 
+    private func announceMaintenance() {
+        guard let msgs = maintenance?.dueMessages(), !msgs.isEmpty else { return }
+        let text = msgs.joined(separator: " · ")
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard let self = self else { return }
+            var d = Data([0x06, 2])
+            d.append(Self.utf8Prefix(text, maxBytes: 90))
+            self.ble?.sendPosition(d)
+            self.voice.say("Lembrete de manutenção: \(text)")
+        }
+    }
+
+    private func sendExtras() {
+        guard isActive, let ble = ble else { return }
+        if let t = trip {
+            var d = Data([0x09, UInt8(clamping: Int(t.avgKmh.rounded())), UInt8(clamping: Int(t.maxKmh.rounded()))])
+            appendLE(&d, UInt16(clamping: Int((t.distance / 100).rounded())))
+            ble.sendPosition(d)
+        }
+        if Date().timeIntervalSince(lastEnvSend) > 20 {
+            lastEnvSend = Date()
+            var d = Data([0x0A])
+            appendLE(&d, Int16(clamping: trafficDelayMin))
+            d.append(weather?.kind ?? 0)
+            d.append(UInt8(bitPattern: Int8(clamping: weather?.temp ?? 0)))
+            appendLE(&d, UInt16(clamping: weather?.rainMin ?? 0))
+            ble.sendPosition(d)
+        }
+    }
+
+    private func refreshEnvironment(_ loc: CLLocation) {
+        if mode == .navigating, let dest = destination, Date().timeIntervalSince(lastTrafficCheck) > 180 {
+            lastTrafficCheck = Date()
+            Task { [weak self] in
+                let src = MKMapItem(placemark: MKPlacemark(coordinate: loc.coordinate))
+                func eta(_ date: Date) async -> TimeInterval? {
+                    let r = MKDirections.Request()
+                    r.source = src
+                    r.destination = dest
+                    r.transportType = .automobile
+                    r.departureDate = date
+                    return try? await MKDirections(request: r).calculateETA().expectedTravelTime
+                }
+                var night = Calendar.current.date(bySettingHour: 3, minute: 0, second: 0, of: Date()) ?? Date()
+                if night <= Date().addingTimeInterval(600) { night = night.addingTimeInterval(86_400) }
+                async let a = eta(Date())
+                async let b = eta(night)
+                let (now, free) = await (a, b)
+                if let n = now, let f = free {
+                    self?.trafficDelayMin = max(0, Int(((n - f) / 60).rounded()))
+                }
+            }
+        }
+        if Date().timeIntervalSince(lastWeatherCheck) > 600 {
+            lastWeatherCheck = Date()
+            var ahead: CLLocationCoordinate2D?
+            var mins = 15
+            if let g = geometry, mode == .navigating {
+                let along = lastAlong
+                let aheadDist = min(15_000, max(0, g.total - along))
+                if aheadDist > 2_000 {
+                    ahead = g.point(at: along + aheadDist)
+                    mins = Int((aheadDist / max(10, max(loc.speed, 13)) / 60).rounded())
+                }
+            }
+            let here = loc.coordinate
+            Task { [weak self] in
+                guard let w = await WeatherService.fetch(here: here, ahead: ahead, aheadMinutes: mins) else { return }
+                guard let self = self else { return }
+                self.weather = w
+                if (w.kind == 1 || w.kind == 3), Date().timeIntervalSince(self.lastWeatherAlert) > 1800 {
+                    self.lastWeatherAlert = Date()
+                    let text = w.kind == 3 ? "Tempestade à frente" : "Chuva à frente em \(w.rainMin) min"
+                    var d = Data([0x06, 3])
+                    d.append(Self.utf8Prefix(text, maxBytes: 80))
+                    self.ble?.sendPosition(d)
+                    self.voice.say(text)
+                }
+            }
+        }
+    }
+
     func pushSettings() {
         guard let ble = ble, let settings = settings else { return }
         lastSettingsPush = Date()
@@ -157,6 +249,7 @@ final class NavigationEngine: ObservableObject {
         mode = .cruising
         voice.reset()
         trip = TripRecorder(title: "Passeio")
+        announceMaintenance()
         startSession(origin: loc.coordinate)
         location?.setBackground(true)
         UIApplication.shared.isIdleTimerDisabled = true
@@ -267,6 +360,7 @@ final class NavigationEngine: ObservableObject {
         mode = .navigating
         voice.reset()
         trip = simulate ? nil : TripRecorder(title: destination?.name ?? "Viagem")
+        if !simulate { announceMaintenance() }
         startSession()
         location?.setBackground(true)
         UIApplication.shared.isIdleTimerDisabled = true
@@ -327,7 +421,11 @@ final class NavigationEngine: ObservableObject {
         if simulating && !simulated { return }
         lastFix = loc
         guard isActive else { return }
-        if !simulated { trip?.add(loc) }
+        if !simulated {
+            trip?.add(loc)
+            maintenance?.track(loc)
+            refreshEnvironment(loc)
+        }
         if mode == .cruising {
             var s = NavSnapshot()
             s.speedKmh = max(0, loc.speed) * 3.6
